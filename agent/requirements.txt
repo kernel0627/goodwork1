@@ -1,0 +1,31 @@
+# Medic — Python 侧依赖（诊断 Agent + 只读工具层）
+#
+# 目标环境：conda `agent`
+#   /Users/traegang/miniforge3/envs/agent/bin/python  (3.10.20)
+# 安装：make pydeps
+#
+# 版本为 2026-07-26 在该环境中实测通过的版本。下限用 >= 是为了不把环境锁死，
+# 注释里的 "实测" 是复现基准——出问题时按这个版本回退。
+
+# ---- Agent 服务 ----
+fastapi>=0.140.0            # 实测 0.140.0
+uvicorn[standard]>=0.51.0   # 实测 0.51.0
+starlette>=1.3.1            # 实测 1.3.1（fastapi 传递依赖，显式钉住便于排障）
+
+# ---- 模型调用 ----
+anthropic>=0.120.0          # 实测 0.120.0
+tiktoken>=0.13.0            # 实测 0.13.0，用于 token 计数与成本核算
+
+# ---- 工具层 / 数据 ----
+httpx>=0.28.1               # 实测 0.28.1，查 Prometheus / Jaeger
+pydantic>=2.13.4            # 实测 2.13.4，工具参数与决策输出的 schema 校验
+PyYAML>=6.0.3               # 实测 6.0.3，读场景定义
+python-dotenv>=1.2.2        # 实测 1.2.2
+
+# ---- 评测与分析 ----
+numpy>=2.2.6                # 实测 2.2.6
+scikit-learn>=1.7.2         # 实测 1.7.2，指标计算（F1 等）
+rich>=15.0.0                # 实测 15.0.0，跑批时的终端输出
+
+# ---- 开发 ----
+pytest>=9.1.1               # 实测 9.1.1

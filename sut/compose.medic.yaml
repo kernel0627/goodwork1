@@ -1,0 +1,16 @@
+# Medic overlay for the OpenTelemetry Demo.
+#
+# 存在的唯一理由：上游 compose 不把 Prometheus 发布到宿主机
+# （既无 ports 映射，也无 Envoy 路由），而诊断工具层必须能跑 PromQL。
+#
+# 这个文件属于本项目，放在本项目目录下。**不修改 SUT 仓库的任何文件。**
+# 作为最后一个 -f 叠加，见根目录 Makefile 的 sut-up。
+#
+# 保持最小：只发布端口，不改镜像、不改命令、不改资源限制。
+# 任何超出「让 medic 能观测」的改动都不应该出现在这里——
+# 改了被测系统，评测结果就不可比了。
+
+services:
+  prometheus:
+    ports:
+      - "9090:9090"

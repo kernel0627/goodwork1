@@ -1,0 +1,29 @@
+# 评测产物
+/results/
+/traces/
+*.log
+
+# 被测系统（外部仓库，不入库）
+/sut/opentelemetry-demo/
+
+# Go
+/gateway/bin/
+*.test
+*.out
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+
+# 环境与密钥
+.env
+.env.local
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
