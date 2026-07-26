@@ -1,0 +1,256 @@
+# Signal query templates -- the single source of truth for "how do you measure X
+# on service Y", read by both the Go verifier and the Python tool layer.
+#
+# Why this file exists instead of the queries living in each language:
+#
+# The SUT is polyglot and its services do not agree on semantic conventions.
+# Measuring an error rate correctly requires covering three metric families at
+# once, and getting it wrong does not produce an error -- it produces a
+# confident zero. A service that is failing hard reads as perfectly healthy.
+#
+# That trap was hit once already while writing the Go verifier. Duplicating
+# these queries in Python would mean hitting it a second time, and this time the
+# victim would be the agent: it would query a broken service, see zero errors,
+# and conclude the service is fine. The agent's competence would be measured
+# against a bug in its own instruments.
+#
+# Placeholders are %SERVICE%, %CONTAINER% and %WINDOW%. Deliberately not
+# {service}: PromQL is full of braces, so brace-based templating in either
+# language would fight the query syntax.
+#
+# ---------------------------------------------------------------------------
+# Measured semconv distribution (2026-07-26, otel-demo 1755859):
+#
+#   rpc_server_duration_milliseconds       ad
+#   rpc_server_call_duration_seconds       checkout, product-catalog
+#   http_server_request_duration_seconds   cart, and others
+#   http_server_duration_milliseconds      frontend
+#
+# Re-check with:
+#   curl -s -G localhost:9090/api/v1/label/service_name/values \
+#     --data-urlencode 'match[]=<metric>_count'
+# ---------------------------------------------------------------------------
+
+defaults:
+  window: 2m
+
+signals:
+
+  error_rate:
+    summary: Server-side failed requests per second for a service.
+    unit: requests/second
+    # Prefer error_ratio for pass/fail decisions; a rate floor cannot be
+    # scale-free across services whose traffic differs by 100x.
+    min_delta: 0.05
+    # Each family is summed independently and the terms are added, so a service
+    # reporting more than one family is counted fully rather than partially.
+    # `or vector(0)` per term is required here because sum() over an empty
+    # vector yields an empty vector, and adding that would void the whole
+    # expression.
+    #
+    # Known gap: cart instruments gRPC as HTTP and reports status 200 even on
+    # failure, because the gRPC status travels in a trailer. Error rate is
+    # therefore blind on cart, and the fault catalog says so.
+    promql: |
+      (sum(rate(rpc_server_duration_milliseconds_count{service_name="%SERVICE%",rpc_grpc_status_code!="0"}[%WINDOW%])) or vector(0))
+      + (sum(rate(rpc_server_call_duration_seconds_count{service_name="%SERVICE%",rpc_response_status_code!="OK"}[%WINDOW%])) or vector(0))
+      + (sum(rate(http_server_duration_milliseconds_count{service_name="%SERVICE%",http_status_code=~"5.."}[%WINDOW%])) or vector(0))
+      + (sum(rate(http_server_request_duration_seconds_count{service_name="%SERVICE%",http_response_status_code=~"5.."}[%WINDOW%])) or vector(0))
+
+  error_ratio:
+    summary: Fraction of a service's requests that fail.
+    unit: ratio            # 0..1
+    min_delta: 0.01        # 1 percentage point of requests
+    # Prefer this over error_rate for deciding whether a fault fired.
+    #
+    # An absolute rate threshold cannot work across this SUT, because a fault's
+    # ceiling is set by how much traffic reaches the code path it breaks.
+    # cartFailure only affects EmptyCart, which runs at ~0.03/s, so even a total
+    # failure produces ~0.03 errors/s -- below a 0.05/s floor. adFailure was
+    # measured moving the rate by only 0.0167/s and was likewise dismissed. Both
+    # were working faults reported as inert.
+    #
+    # As a fraction the comparison is scale-free: a service failing 3% of its
+    # requests reads as 0.03 whether it serves one request a second or a
+    # thousand.
+    #
+    # The denominator guard matters: on an idle service the ratio would be 0/0.
+    # Requiring a floor of 0.01 req/s yields 0 rather than NaN, which keeps the
+    # verifier from treating "no traffic" as "no fault".
+    promql: |
+      (
+        (sum(rate(rpc_server_duration_milliseconds_count{service_name="%SERVICE%",rpc_grpc_status_code!="0"}[%WINDOW%])) or vector(0))
+        + (sum(rate(rpc_server_call_duration_seconds_count{service_name="%SERVICE%",rpc_response_status_code!="OK"}[%WINDOW%])) or vector(0))
+        + (sum(rate(http_server_duration_milliseconds_count{service_name="%SERVICE%",http_status_code=~"5.."}[%WINDOW%])) or vector(0))
+        + (sum(rate(http_server_request_duration_seconds_count{service_name="%SERVICE%",http_response_status_code=~"5.."}[%WINDOW%])) or vector(0))
+      )
+      / clamp_min(
+        (sum(rate(rpc_server_duration_milliseconds_count{service_name="%SERVICE%"}[%WINDOW%])) or vector(0))
+        + (sum(rate(rpc_server_call_duration_seconds_count{service_name="%SERVICE%"}[%WINDOW%])) or vector(0))
+        + (sum(rate(http_server_duration_milliseconds_count{service_name="%SERVICE%"}[%WINDOW%])) or vector(0))
+        + (sum(rate(http_server_request_duration_seconds_count{service_name="%SERVICE%"}[%WINDOW%])) or vector(0))
+      , 0.01)
+
+  request_rate:
+    summary: Total server-side requests per second for a service, all statuses.
+    unit: requests/second
+    min_delta: 0.05
+    promql: |
+      (sum(rate(rpc_server_duration_milliseconds_count{service_name="%SERVICE%"}[%WINDOW%])) or vector(0))
+      + (sum(rate(rpc_server_call_duration_seconds_count{service_name="%SERVICE%"}[%WINDOW%])) or vector(0))
+      + (sum(rate(http_server_duration_milliseconds_count{service_name="%SERVICE%"}[%WINDOW%])) or vector(0))
+      + (sum(rate(http_server_request_duration_seconds_count{service_name="%SERVICE%"}[%WINDOW%])) or vector(0))
+
+  latency_p99:
+    summary: 99th percentile server latency for a service.
+    unit: milliseconds
+    min_delta: 50
+    # Here the families are chained with `or`, not added: a percentile from one
+    # family cannot be summed with a percentile from another. `or` selects
+    # whichever family the service actually reports.
+    #
+    # The single `or vector(0)` sits at the very tail, and that placement is
+    # load bearing. Written per-term as (A or vector(0)) or B, the first term
+    # always yields something -- A when present, otherwise 0 -- so B would never
+    # be consulted, and every service reporting only a later family would
+    # measure a flat zero. That bug made a working latency fault look inert.
+    promql: |
+      max(
+        histogram_quantile(0.99, sum by (le) (rate(rpc_server_duration_milliseconds_bucket{service_name="%SERVICE%"}[%WINDOW%])))
+        or
+        1000 * histogram_quantile(0.99, sum by (le) (rate(rpc_server_call_duration_seconds_bucket{service_name="%SERVICE%"}[%WINDOW%])))
+        or
+        histogram_quantile(0.99, sum by (le) (rate(http_server_duration_milliseconds_bucket{service_name="%SERVICE%"}[%WINDOW%])))
+        or
+        1000 * histogram_quantile(0.99, sum by (le) (rate(http_server_request_duration_seconds_bucket{service_name="%SERVICE%"}[%WINDOW%])))
+      ) or vector(0)
+
+  latency_p50:
+    summary: Median server latency for a service.
+    unit: milliseconds
+    min_delta: 50
+    # Comparing p50 against p99 is what separates "everything is slow" from
+    # "the tail is slow", which are different faults with different causes.
+    promql: |
+      max(
+        histogram_quantile(0.50, sum by (le) (rate(rpc_server_duration_milliseconds_bucket{service_name="%SERVICE%"}[%WINDOW%])))
+        or
+        1000 * histogram_quantile(0.50, sum by (le) (rate(rpc_server_call_duration_seconds_bucket{service_name="%SERVICE%"}[%WINDOW%])))
+        or
+        histogram_quantile(0.50, sum by (le) (rate(http_server_duration_milliseconds_bucket{service_name="%SERVICE%"}[%WINDOW%])))
+        or
+        1000 * histogram_quantile(0.50, sum by (le) (rate(http_server_request_duration_seconds_bucket{service_name="%SERVICE%"}[%WINDOW%])))
+      ) or vector(0)
+
+  client_error_ratio:
+    summary: Fraction of a caller's outbound calls to one peer that fail.
+    unit: ratio            # 0..1
+    min_delta: 0.01
+    # For services that report no server-side metrics at all. Measured
+    # 2026-07-26: payment, recommendation and email are all at 0.000 req/s
+    # server-side, so paymentFailure is structurally invisible from payment's
+    # own metrics no matter how completely it fails.
+    #
+    # This is also how a real oncall diagnoses "is payment down": look at what
+    # its callers see.
+    #
+    # Keyed on %CALLER% and an %RPC_PATTERN% regex over rpc_method, not on
+    # server_address. Measured: checkout's client metrics carry
+    # server_address="172.18.0.15", a container IP that changes on restart,
+    # while rpc_method carries the stable "oteldemo.PaymentService/Charge".
+    promql: |
+      (
+        (sum(rate(rpc_client_duration_milliseconds_count{service_name="%CALLER%",rpc_method=~"%RPC_PATTERN%",rpc_grpc_status_code!="0"}[%WINDOW%])) or vector(0))
+        + (sum(rate(rpc_client_call_duration_seconds_count{service_name="%CALLER%",rpc_method=~"%RPC_PATTERN%",rpc_response_status_code!="OK"}[%WINDOW%])) or vector(0))
+      )
+      / clamp_min(
+        (sum(rate(rpc_client_duration_milliseconds_count{service_name="%CALLER%",rpc_method=~"%RPC_PATTERN%"}[%WINDOW%])) or vector(0))
+        + (sum(rate(rpc_client_call_duration_seconds_count{service_name="%CALLER%",rpc_method=~"%RPC_PATTERN%"}[%WINDOW%])) or vector(0))
+      , 0.01)
+
+  client_call_rate_by_peer:
+    summary: A caller's outbound call rate broken down by target method.
+    unit: calls/second
+    multi_series: true
+    # Reveals the dependency graph as actually exercised, and shows a call path
+    # going silent -- which is what a connectivity fault looks like from
+    # outside.
+    promql: |
+      sum by (rpc_method) (
+        rate(rpc_client_duration_milliseconds_count{service_name="%CALLER%"}[%WINDOW%])
+        or rate(rpc_client_call_duration_seconds_count{service_name="%CALLER%"}[%WINDOW%])
+      )
+
+  cpu:
+    summary: Container CPU utilisation.
+    unit: cores            # MEASURED: exceeds 1.0 (saw 1.586 on ad), so this is
+                           # summed across cores, not a 0..1 fraction. The
+                           # metric name says ratio; it is not one.
+    min_delta: 0.2
+    # Container metrics carry container_name and have no service_name, so these
+    # take %CONTAINER% rather than %SERVICE%. For this SUT the two happen to
+    # coincide, but relying on that would break the moment they do not.
+    promql: max(container_cpu_utilization_ratio{container_name="%CONTAINER%"}) or vector(0)
+
+  memory:
+    summary: Container memory usage as a fraction of its limit.
+    unit: percent          # MEASURED: returns 93.76, i.e. 0..100 not 0..1,
+                           # despite being named *_percent_ratio. A 0.05
+                           # threshold here would mean 0.05 percentage points.
+    min_delta: 5
+    # Every service in this SUT sets deploy.resources.limits.memory, so a large
+    # enough leak reaches a real OOM rather than merely trending upward.
+    promql: max(container_memory_percent_ratio{container_name="%CONTAINER%"}) or vector(0)
+
+  consumer_lag:
+    summary: Total Kafka consumer lag in records, across all groups.
+    unit: records
+    min_delta: 1
+    promql: sum(kafka_consumer_records_lag) or vector(0)
+
+  consumer_lag_by_service:
+    summary: Kafka consumer lag in records for one consuming service.
+    unit: records
+    min_delta: 1
+    promql: sum(kafka_consumer_records_lag{service_name="%SERVICE%"}) or vector(0)
+
+  flag_evaluations:
+    summary: Rate at which a feature flag is being evaluated, all services.
+    unit: evaluations/second
+    min_delta: 0
+    # Tier-1 fault verification. Note this is a static property, not a
+    # before/after delta: the load generator keeps traffic flowing so services
+    # consult their flags continuously, and the counter climbs whether or not
+    # anything is injected. What it answers is "does anything read this flag at
+    # all" -- and a flag nothing reads cannot fire.
+    promql: sum(rate(feature_flag_evaluation_requests_total{feature_flag_key="%FLAG%"}[5m])) or vector(0)
+
+  error_rate_by_endpoint:
+    summary: Failed requests per second broken down by endpoint.
+    unit: requests/second
+    multi_series: true
+    # Kept separate from error_rate because it returns many series. It is the
+    # query that reveals a fault confined to one endpoint -- cartFailure only
+    # affects EmptyCart, and an aggregate over the whole service buries it.
+    promql: |
+      sum by (rpc_method, http_route) (
+        rate(rpc_server_duration_milliseconds_count{service_name="%SERVICE%",rpc_grpc_status_code!="0"}[%WINDOW%])
+        or rate(rpc_server_call_duration_seconds_count{service_name="%SERVICE%",rpc_response_status_code!="OK"}[%WINDOW%])
+        or rate(http_server_duration_milliseconds_count{service_name="%SERVICE%",http_status_code=~"5.."}[%WINDOW%])
+        or rate(http_server_request_duration_seconds_count{service_name="%SERVICE%",http_response_status_code=~"5.."}[%WINDOW%])
+      )
+
+  request_rate_by_endpoint:
+    summary: Requests per second broken down by endpoint, all statuses.
+    unit: requests/second
+    multi_series: true
+    # Traffic shape sets the ceiling on how visible a fault can be. EmptyCart
+    # runs at ~0.03/s, so a fault scoped to it can never produce more than that
+    # much error rate no matter how completely it fails.
+    promql: |
+      sum by (rpc_method, http_route) (
+        rate(rpc_server_duration_milliseconds_count{service_name="%SERVICE%"}[%WINDOW%])
+        or rate(rpc_server_call_duration_seconds_count{service_name="%SERVICE%"}[%WINDOW%])
+        or rate(http_server_duration_milliseconds_count{service_name="%SERVICE%"}[%WINDOW%])
+        or rate(http_server_request_duration_seconds_count{service_name="%SERVICE%"}[%WINDOW%])
+      )

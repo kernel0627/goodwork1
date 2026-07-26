@@ -145,10 +145,72 @@
   - 已定义**两级生效校验**：flagd 侧评估计数增长（必要）+ 下游症状偏移（充分）。
     两级都过才算场景有效
 
+- [x] **生效校验器 + characterize 命令**（`internal/promq`、`internal/inject/verify.go`、
+  `cmd/characterize`），一跑就抓到真问题（见下）
+- [x] **🔴 重大纠错：catalog 有一半是错的** → `docs/faults.md` §2
+  - 起因：烟测报 `cartFailure=100%` 为 inert（前后都是 0）。读源码发现它
+    **只作用于 `EmptyCart`**，而实测 EmptyCart 只有 **0.03/s**
+    （GetCart 0.67/s、AddItem 0.22/s），故障的**理论上限低于我设的 0.05/s 阈值**
+    —— 失败得再彻底也读作 inert
+  - 顺势 grep 了全部 13 个 flag 的源码作用点，纠正了 6 条：
+    `imageSlowLoad` 其实是**浏览器组件设 Envoy 延迟头**（与 image-provider 无关，
+    k6 不渲染页面所以大概打不到）；`recommendationCacheFailure` 其实是**内存泄漏**；
+    `failedReadinessProbe` **从不碰请求路径**；`paymentUnreachable` 由 **checkout** 读；
+    `kafkaQueueProblems` 根因是 **checkout** 不是 kafka
+  - **结论：爆炸半径是「读 flag 那段代码」的属性，不是 flag 名字的属性。**
+    每条 Spec 加了 `Site` 字段指向源码位置，有测试强制要求填
+  - 代码相应改动：`MinDeltaOverride`（阈值高于故障上限会让它永远不可验证）、
+    `SyntheticLoadReaches`（两条打不到的故障排除出场景库，有测试钉住）
+- [x] **修了两个自己的 bug**
+  - 一级判据写成「注入后评估计数有增长」是**错的**：load-generator 一直在跑，
+    计数恒增，判据恒真。正确的是静态属性「有没有服务在读这个 flag」
+  - `latencyP99` 的 fallback 链被**短路**：`(A or vector(0)) or B` 中第一项永远有值
+    （A 为空就是 0），B 永远轮不到，只上报后面家族的服务会measure 出平坦的 0。
+    默认值必须放链尾。这条是 `TestCatalogQueriesAreScalar`（对活 Prometheus 跑
+    全部判据查询）抓出来的 —— **PromQL 出错是静默的**，标签拼错也会返回东西
+
+- [x] **`queries/signals.yaml` — 信号查询的单一真源**（14 个信号，Go 侧
+  `internal/signals` 已接入并测试通过；Python 工具层将读同一份）
+  - 起因：Go 校验器和 Python 工具层都要「某服务的错误率/延迟」。各写一份的话，
+    semconv 这种坑会在两个语言里各踩一次，而**第二个受害者是 Agent**
+    —— 它会查到一个正在崩的服务、看到 0 错误、得出「服务健康」，
+    它的能力等于被自己仪器的 bug 打了折
+  - 阈值 `min_delta` 与查询放在一起，因为**阈值是单位的属性**
+- [x] **🔴 又抓到一个严重 bug（假阳性）**：新 semconv 用
+  `rpc_response_status_code="OK"`（字符串），不是 `rpc_grpc_status_code="0"`（数字）。
+  而 **PromQL 里 `label!="0"` 会匹配「该标签不存在」的 series** ——
+  所以我给 `checkout` / `product-catalog` 写的错误率查询把**所有请求都算成错误**。
+  幸好在全量跑之前发现。有测试 `TestNewSemconvStatusLabels` 钉住四套状态约定
+- [x] **改用错误比例而非绝对速率**。绝对阈值在这个 SUT 上系统性失效：
+  故障的信号上限由「打到被破坏代码路径的流量」决定。实测各服务请求速率相差 100 倍
+  （frontend 6.5/s ↔ checkout 0.067/s）。比例是尺度无关的
+- [x] **单位纠错**（名字骗人）：`container_memory_percent_ratio` 实测返回 **93.76**，
+  是 0..100 不是 0..1；`container_cpu_utilization_ratio` 实测 **1.586**，是核数不是比例。
+  按「故障类别」定阈值对内存**差了 100 倍**
+- [x] **发现三个服务完全没有服务端指标**：`payment` / `recommendation` / `email`
+  实测 0.000 req/s。所以 `paymentFailure` 从 payment 自己的指标看**结构性不可见**。
+  加了 `client_error_ratio` 走**调用方视角**（真实 SRE 判断「payment 是不是挂了」
+  就是看它的调用方）。注意不能用 `server_address` 过滤 —— 实测那是**容器 IP**
+  （`172.18.0.15`），重启就变；要用 `rpc_method=~"oteldemo.PaymentService/.*"`
+
 ### 🔄 进行中
 
-- [ ] **T3 收尾**：写生效校验器（Go，两级判据），逐条注入 13 个故障，
-  实测签名并填 `docs/faults.md` §2 的「验证状态」列。未验证的故障不许进场景库
+- [ ] **T3 收尾（阻塞项已全部解除，可以跑了）**
+  - ⚠️ **一级判据要重做**：flagd 的评估指标**只有 .NET 的 cart 服务上报**，
+    烟测里 `adFailure` 因此被判 "dead"。除 cart 读的两个 flag 外，其余 11 个永远假阴性。
+    替代方案：读 **flagd 容器日志**里的 `filepath event ... WRITE`（已确认它会打），
+    这是通用的；评估指标降级为「有则作为补充证据」
+  - 把 `catalog.go` 的内联查询换成 `signals.yaml`（同时自动获得漏掉的
+    `rpc_server_call_duration_seconds` 家族）
+  - 然后 `characterize` 全量跑 13 个故障（约 52 分钟），
+  填 `docs/faults.md` §3 的「验证状态」列。未验证的故障不许进场景库
+  - 已确认三套 semconv 并存，查询必须同时覆盖：
+    `rpc_server_duration_milliseconds`（仅 ad）、
+    `rpc_server_call_duration_seconds`（checkout / product-catalog）、
+    `http_server_request_duration_seconds`（cart 等）、
+    `http_server_duration_milliseconds`（frontend）
+  - ⚠️ 待处理：`cart` 把 gRPC 记成 HTTP 且**状态码全是 200**（gRPC 状态在 trailer 里），
+    错误率查询对 cart 可能天生看不见 —— 全量跑完确认
 
 ### ⏳ 待办（按依赖顺序）
 
