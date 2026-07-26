@@ -23,7 +23,40 @@
 
 ---
 
-## 2. 故障总表
+## 2. ⚠️ 最重要的一条教训：爆炸半径只能从源码得到
+
+本文件的第一版是照 flag 的名字和描述写的。**大约一半是错的。**
+
+| flag | 从名字/描述推断 | 源码真相 |
+|---|---|---|
+| `cartFailure` | cart 服务失败 | **只作用于 `EmptyCart`**。实测 GetCart 0.67/s、AddItem 0.22/s、**EmptyCart 0.03/s** —— 故障的理论上限低于默认判定阈值，导致「注入满档也读作 inert」 |
+| `imageSlowLoad` | image-provider 变慢 | **和 image-provider 无关**。浏览器组件读 flag 后设 `x-envoy-fault-delay-request` 头，由 **Envoy** 施加延迟。k6 只发 HTTP 请求不渲染页面，**合成流量大概打不到** |
+| `recommendationCacheFailure` | 缓存失效导致延迟 | **是内存泄漏**。每次 miss 把 `cached_ids` 的 1/4 追加回自身，列表无界增长。类别应为 resource 而非 cache |
+| `failedReadinessProbe` | 该服务请求出错 | 返回 `HealthCheckResult.Unhealthy`，**从不碰请求路径**。信号在 gRPC health 端点和容器健康状态，两者都不进 Prometheus |
+| `paymentUnreachable` | payment 出错 | **checkout 读这个 flag** 并拒绝去连 payment。症状在调用方，被点名的服务只是「看起来不在了」 |
+| `kafkaQueueProblems` | kafka 故障 | **checkout 是那个把队列压垮的生产者**，根因是 checkout 不是 kafka |
+
+> **故障的爆炸半径和可观测签名，是「读这个 flag 的那段代码」的属性，不是 flag 名字的属性。**
+> 每条 Spec 都记了 `Site` 字段指向源码位置，以后要质疑某个判定，从源码查，不要从直觉查。
+
+这也正是**两级校验设计的价值** —— 它是唯一发现这些错误的机制。如果当初直接拿
+「按名字猜出来的 catalog」去建场景库，会得到一批「看起来注入了其实没生效」的假场景，
+后面所有数字都是脏的，而且**任何地方都不会报错**。
+
+### 合成流量打不到的故障
+
+两条已标记 `SyntheticLoadReaches: false`，**不进场景库**（无论校验结果如何，
+因为没有流量会触发它们）：
+
+- `imageSlowLoad` —— 需要浏览器渲染 ProductCard
+- `failedReadinessProbe` —— 需要容器级健康探针，Prometheus 里看不到
+
+有单元测试 `TestFaultsUnreachableBySyntheticLoadAreFlagged` 钉住这两条，
+上游若改了实现，测试会先叫。
+
+---
+
+## 3. 故障总表
 
 难度定义：
 - **L1 直接** — 症状服务就是根因服务，指标上一眼可见
@@ -31,21 +64,40 @@
 - **L3 推理** — 症状形态与根因类型不一致（例如缓存失效表现为延迟而非错误），
   或跨异步边界，需要形成并验证假设
 
-| # | flag | 变体 | 类别 | 根因服务 | 预期症状出现在 | 归因难度 | 验证状态 |
-|---|---|---|---|---|---|---|---|
-| 1 | `adFailure` | on/off | 错误率 | ad | frontend（广告位报错） | L2 | ⬜ 待验证 |
-| 2 | `adHighCpu` | on/off | 资源 | ad | ad 延迟↑，frontend 长尾 | L2 | ⬜ 待验证 |
-| 3 | `adManualGc` | on/off | 资源→延迟 | ad | ad 周期性延迟毛刺 | **L3** | ⬜ 待验证 |
-| 4 | `cartFailure` | 10/25/50/75/90/100% | 错误率 | cart | frontend、checkout | L2 | ⬜ 待验证 |
-| 5 | `emailMemoryLeak` | 1x/10x/100x/1000x/10000x | 资源 | email | email OOM/重启，checkout 尾部失败 | **L3** | ⬜ 待验证 |
-| 6 | `failedReadinessProbe` | on/off | 健康检查 | **cart**（flag 描述明确写了 "for cart service"） | cart 被判不健康 | L1 | ⬜ 待验证 |
-| 7 | `imageSlowLoad` | 5sec/10sec | 延迟 | image-provider | frontend 页面加载慢 | L2 | ⬜ 待验证 |
-| 8 | `intlShippingSlowdown` | 5sec/10sec | 延迟 | shipping | checkout P99↑（**仅国际订单**，条件触发） | **L3** | ⬜ 待验证 |
-| 9 | `kafkaQueueProblems` | on/off | 队列/异步 | kafka | accounting、fraud-detection 消费滞后 | **L3** | ⬜ 待验证 |
-| 10 | `paymentFailure` | 10/25/50/75/90/100% | 错误率 | payment | checkout 下单失败 | L2 | ⬜ 待验证 |
-| 11 | `paymentUnreachable` | on/off | 连通 | payment | checkout 连接错误 | L2 | ⬜ 待验证 |
-| 12 | `productCatalogFailure` | on/off | 错误率 | product-catalog | frontend **和** recommendation（扇出） | L2 | ⬜ 待验证 |
-| 13 | `recommendationCacheFailure` | on/off | 缓存 | recommendation | recommendation 延迟↑ 而非报错 | **L3** | ⬜ 待验证 |
+下表的「根因 / 症状 / 类别」三列**全部来自源码**（`Site` 列给出位置），
+不是从 flag 名字推的。权威定义在 `gateway/internal/inject/catalog.go`，
+本表与之同步；不一致时以代码为准。
+
+| # | flag | 变体 | 类别 | 根因服务 | 症状服务 | 难度 | Site（源码位置） | 合成流量可达 | 验证状态 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | `adFailure` | on | 错误率 | ad | ad | L2 | `ad/…/AdService.java:164` (getAds) | ✅ | ⬜ |
+| 2 | `adHighCpu` | on | 资源 | ad | ad | L2 | `ad/…/AdService.java:166` | ✅ | ⬜ |
+| 3 | `adManualGc` | on | 资源→延迟 | ad | ad | **L3** | `ad/…/AdService.java:165` | ✅ | ⬜ |
+| 4 | `cartFailure` | 10–100% | 错误率 | cart | cart | L2 | `cart/…/CartService.cs:82` **仅 EmptyCart** | ✅ 但极弱 | ⬜ |
+| 5 | `emailMemoryLeak` | 1x–10000x | 资源 | email | email | **L3** | `email/email_server.rb:67` | ✅ | ⬜ |
+| 6 | `failedReadinessProbe` | on | 健康检查 | cart | cart | L1 | `cart/…/HealthCheckService.cs:36` | ❌ | ⬜ |
+| 7 | `imageSlowLoad` | 5/10sec | 延迟 | **frontend-proxy** | frontend-proxy | **L3** | `frontend/components/ProductCard/ProductCard.tsx:32` | ❌ | ⬜ |
+| 8 | `intlShippingSlowdown` | 5/10sec | 延迟 | shipping | shipping | **L3** | `shipping/src/shipping_service.rs:67` | ✅ 仅国际订单 | ⬜ |
+| 9 | `kafkaQueueProblems` | on | 队列/异步 | **checkout** | fraud-detection | **L3** | `checkout/main.go:707` | ✅ | ⬜ |
+| 10 | `paymentFailure` | 10–100% | 错误率 | payment | payment | L2 | `payment/charge.js:39` | ✅ | ⬜ |
+| 11 | `paymentUnreachable` | on | 连通 | payment | **checkout** | L2 | `checkout/flags/flags_gen.go:51` | ✅ | ⬜ |
+| 12 | `productCatalogFailure` | on | 错误率 | product-catalog | product-catalog | L2 | `product-catalog/flags/flags_gen.go:29` | ✅ 仅单个商品 | ⬜ |
+| 13 | `recommendationCacheFailure` | on | **资源**（非缓存） | recommendation | recommendation | **L3** | `recommendation/recommendation_server.py:78` | ✅ | ⬜ |
+
+变体列只列出用于校验的档位；完整可选值见 `injector list`。
+`合成流量可达 = ❌` 的两条不进场景库（§2）。
+
+### 实测的调用速率（决定各故障的信号上限）
+
+| 端点 | 速率 |
+|---|---:|
+| `cart/GetCart` | 0.67 /s |
+| `cart/AddItem` | 0.22 /s |
+| `cart/EmptyCart` | **0.03 /s** ← `cartFailure` 的天花板 |
+
+**判定阈值必须低于故障的信号上限**，否则满档注入也会读作 inert。
+`cartFailure` 与 `productCatalogFailure` 因此在 catalog 里有
+`MinDeltaOverride: 0.01`。
 
 ### 非故障开关（作为实验变量，不作为故障）
 
@@ -56,7 +108,7 @@
 
 ---
 
-## 3. 依赖关系（用于判定「症状 vs 根因」）
+## 4. 依赖关系（用于判定「症状 vs 根因」）
 
 从 compose 与服务定义推断，**待用 Jaeger 实际调用链核对**：
 
@@ -81,7 +133,7 @@ frontend ──┬─▶ product-catalog ◀── recommendation
 
 ---
 
-## 4. 场景库设计（T4）
+## 5. 场景库设计（T4）
 
 计划 40–60 个场景，配比：
 
@@ -98,7 +150,7 @@ frontend ──┬─▶ product-catalog ◀── recommendation
 
 ---
 
-## 5. 可观测签名 —— 实测的指标与 PromQL
+## 6. 可观测签名 —— 实测的指标与 PromQL
 
 Prometheus 里共 **524 个指标**。验证故障是否生效、以及 Agent 诊断时要查什么，
 都落在下面这几组上。
@@ -119,31 +171,33 @@ Prometheus 里共 **524 个指标**。验证故障是否生效、以及 Agent �
 
 flagd 的 OTel 遥测带 `feature_flag_key` 和 `service_name` 两个标签。这给了两个能力：
 
-1. **经验性地测出 flag → 服务的映射**，不用从 flag 描述文字猜。
-   §2 表里「根因服务」一列应当用这个指标核对，而不是信描述。
-2. **确认某服务确实在评估这个 flag**。注入后如果该 flag 的评估计数没有增长，
-   说明根本没有服务在读它 —— 场景无效，直接作废。
-
-> 注意：实测当前只有 `cartFailure` 和 `failedReadinessProbe` 两个 key 有数据，
-> 因为只有真正去查 flag 的服务才会上报。这本身就是信息：
-> **注入前后对比这个指标，才知道注入通道是否打通。**
+1. **经验性地测出 flag → 服务的映射**，用来交叉核对从源码读出的 `Site`。
+2. **确认确实有服务在读这个 flag**。没有服务读它，故障就不可能触发。
 
 ### 生效校验的两级判据
 
 ```
-一级（必要）：flagd 侧    feature_flag_evaluation_requests_total{feature_flag_key="X"} 有增长
-二级（充分）：下游症状    对应的错误率 / 延迟 / 资源指标出现预期偏移
+一级（必要）  有没有服务在评估这个 flag
+              sum(rate(feature_flag_evaluation_requests_total{feature_flag_key="X"}[5m])) > 0
+
+二级（充分）  预期信号是否发生偏移
+              对应的错误率 / 延迟 / 资源 / 队列指标，注入前后差值 ≥ 阈值
 ```
 
-两级都过才算场景有效。只过一级说明 flag 读到了但没生效；
-只过二级说明症状可能来自别的原因（噪声、其他故障残留）。
+两级都过才算场景有效。只过一级 = flag 读到了但没生效（inert）；
+只过二级 = 症状可能来自噪声或上个场景的残留，归因给这个故障是错的（suspect）。
+
+> ⚠️ **一级判据是静态属性，不是前后差值。** 我第一版写成「注入后评估计数有增长」，
+> **那是错的**：load-generator 一直在跑，服务持续查 flag，计数在注入前就一直在涨，
+> 所以「增长」恒为真，判据失效。正确的问题是「有没有任何服务在读它」。
+> 代码里 `EvaluationQuery` 的注释记了这件事。
 
 ---
 
-## 6. 待办
+## 7. 待办
 
 - [ ] 逐条注入验证，填「验证状态」列，记录每条故障在 Prometheus 上的**实际可观测签名**
 - [ ] 确认 `failedReadinessProbe` 作用于哪个服务（配置里未直接体现，需实测）
 - [ ] 确认 `intlShippingSlowdown` 的触发条件（疑似仅国际订单，需构造对应流量）
-- [ ] 用 Jaeger 实际调用数据核对 §3 依赖图
+- [ ] 用 Jaeger 实际调用数据核对 §4 依赖图
 - [ ] 测量各故障从注入到指标可见的**延迟**（决定 runner 的等待时长）
