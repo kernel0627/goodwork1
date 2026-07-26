@@ -58,6 +58,17 @@ type Spec struct {
 	// that faults are measured as ratios rather than absolute rates.
 	MinDeltaOverride float64
 
+	// SettleSeconds overrides how long to wait before measuring, for faults that
+	// need longer than the default to become visible.
+	//
+	// Not every fault appears at the same speed. An error rate is there on the
+	// next request; a memory leak has to accumulate. recommendationCacheFailure
+	// moved container memory by 0.03 percentage points in 150 seconds and read as
+	// inert -- which was a statement about the wait, not about the fault. A single
+	// global settle time silently discriminates against slow faults, and the
+	// verdict gives no hint that timing was the problem.
+	SettleSeconds int
+
 	// Site is where the flag is read in the SUT's source. Recorded because the
 	// blast radius came out of reading that code, and the next person to
 	// question a verdict should start there rather than from the flag's name.
@@ -272,10 +283,19 @@ func Catalog() []Spec {
 			Subs:                 map[string]string{"container": "recommendation"},
 			SignalRises:          true,
 			SyntheticLoadReaches: true,
+			// Ten minutes rather than the default two and a half. Measured at the
+			// default it moved memory from 15.42% to 15.45% -- 0.03 points against
+			// a 5-point threshold -- and read as inert. The leak is real; the wait
+			// was too short for it to show.
+			SettleSeconds:    600,
+			MinDeltaOverride: 2,
 			Note: "despite the name this is a memory leak, not a cache miss problem: on each " +
 				"miss the code appends a quarter of cached_ids back onto itself, so the list " +
 				"grows without bound. Class is resource, not cache. recommendation also " +
-				"reports no server-side request metrics, so memory is the only signal",
+				"reports no server-side request metrics, so memory is the only signal. " +
+				"Being an accumulating fault it needs a long settle: at 150s it had moved " +
+				"memory by 0.03 percentage points, which said more about the wait than " +
+				"about the fault",
 		},
 	}
 }

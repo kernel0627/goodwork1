@@ -72,8 +72,10 @@ func main() {
 	// keyed by flag. The catalog is the definition; characterisation is evidence
 	// about it.
 	subsByFlag := map[string]map[string]string{}
+	settleByFlag := map[string]int{}
 	for _, spec := range inject.Catalog() {
 		subsByFlag[spec.Flag] = spec.Subs
+		settleByFlag[spec.Flag] = spec.SettleSeconds
 	}
 
 	settle := int(chars.SettleSeconds)
@@ -95,6 +97,13 @@ func main() {
 			skipped = append(skipped, fmt.Sprintf("%s (%s)", f.Flag, shortStatus(f.Status)))
 			continue
 		}
+		// A fault that needs a longer wait during characterisation needs the
+		// same wait during evaluation, or the agent is shown a symptom that has
+		// not appeared yet.
+		faultSettle := settle
+		if override := settleByFlag[f.Flag]; override > 0 {
+			faultSettle = override
+		}
 		lib.Scenarios = append(lib.Scenarios, scenario.Scenario{
 			ID:          fmt.Sprintf("%s-%s", f.Flag, f.Difficulty),
 			Description: describe(f.Flag, f.Variant, f.RootCause, f.SymptomAt),
@@ -105,7 +114,7 @@ func main() {
 				RootCauseClass:   f.Class,
 				SymptomService:   f.SymptomAt,
 			},
-			SettleSeconds:  settle,
+			SettleSeconds:  faultSettle,
 			RecoverSeconds: recoverFor,
 			MaxSteps:       *maxSteps,
 			Signal:         f.Signal,

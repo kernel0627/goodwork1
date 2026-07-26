@@ -175,7 +175,13 @@ func (v *Verifier) Verify(ctx context.Context, spec Spec) Verdict {
 		}
 	}()
 
-	if err := sleepCtx(ctx, v.Settle); err != nil {
+	// Some faults need longer than the default before they are visible; see
+	// Spec.SettleSeconds.
+	settle := v.Settle
+	if spec.SettleSeconds > 0 {
+		settle = time.Duration(spec.SettleSeconds) * time.Second
+	}
+	if err := sleepCtx(ctx, settle); err != nil {
 		out.Err = err
 		return out
 	}

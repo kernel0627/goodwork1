@@ -191,13 +191,51 @@ type record struct {
 	Status               string   `json:"status"`
 	Note                 string   `json:"note,omitempty"`
 	ElapsedSeconds       float64  `json:"elapsed_seconds"`
+	MeasuredAt           string   `json:"measured_at"`
 }
 
+// mergeWithExisting overlays fresh records onto whatever was measured before,
+// keyed by flag, and returns the union sorted by flag.
+func mergeWithExisting(path string, fresh []record) []record {
+	byFlag := map[string]record{}
+
+	if raw, err := os.ReadFile(path); err == nil {
+		var previous struct {
+			Faults []record `json:"faults"`
+		}
+		if json.Unmarshal(raw, &previous) == nil {
+			for _, r := range previous.Faults {
+				byFlag[r.Flag] = r
+			}
+		}
+	}
+	for _, r := range fresh {
+		byFlag[r.Flag] = r
+	}
+
+	out := make([]record, 0, len(byFlag))
+	for _, r := range byFlag {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Flag < out[j].Flag })
+	return out
+}
+
+// writeResults merges into any existing output rather than replacing it.
+//
+// Characterisation takes the better part of an hour for all thirteen faults, and
+// fixing one fault's signal should not mean re-measuring the other twelve. A
+// `-only` run therefore updates just the faults it measured and leaves the rest
+// as they were.
+//
+// The risk of merging is a stale entry passing itself off as current, so each
+// record carries the time it was measured.
 func writeResults(dir string, verdicts []inject.Verdict, settle, recover time.Duration) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
 
+	measuredAt := time.Now().UTC().Format(time.RFC3339)
 	recs := make([]record, 0, len(verdicts))
 	for _, v := range verdicts {
 		svcs := v.EvaluatingServices
@@ -215,13 +253,16 @@ func writeResults(dir string, verdicts []inject.Verdict, settle, recover time.Du
 			MinDelta: v.MinDelta, Tier2Pass: v.Tier2Pass,
 			Valid: v.Valid(), Status: v.Status(),
 			Note: v.Spec.Note, ElapsedSeconds: v.Elapsed.Seconds(),
+			MeasuredAt: measuredAt,
 		})
 	}
+
+	merged := mergeWithExisting(filepath.Join(dir, "characterization.json"), recs)
 
 	payload := map[string]any{
 		"settle_seconds":  settle.Seconds(),
 		"recover_seconds": recover.Seconds(),
-		"faults":          recs,
+		"faults":          merged,
 	}
 	buf, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -233,7 +274,7 @@ func writeResults(dir string, verdicts []inject.Verdict, settle, recover time.Du
 	}
 
 	mdPath := filepath.Join(dir, "characterization.md")
-	if err := os.WriteFile(mdPath, []byte(renderMarkdown(recs, settle, recover)), 0o644); err != nil {
+	if err := os.WriteFile(mdPath, []byte(renderMarkdown(merged, settle, recover)), 0o644); err != nil {
 		return err
 	}
 	fmt.Printf("\nwrote %s\n      %s\n", jsonPath, mdPath)
