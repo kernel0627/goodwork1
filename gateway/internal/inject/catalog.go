@@ -126,17 +126,30 @@ func Catalog() []Spec {
 		},
 		{
 			Flag: "cartFailure", Variant: "100%",
-			Class: ClassError, RootCause: "cart", SymptomAt: "cart", Difficulty: L2,
-			Site:                 "cart/src/services/CartService.cs:82 (EmptyCart only)",
-			Signal:               "error_ratio",
-			Subs:                 map[string]string{"service": "cart"},
+			Class: ClassError, RootCause: "cart", SymptomAt: "checkout", Difficulty: L2,
+			Site:   "cart/src/services/CartService.cs:82 (EmptyCart only)",
+			Signal: "client_error_ratio",
+			Subs: map[string]string{
+				"caller":      "checkout",
+				"rpc_pattern": "oteldemo.CartService/EmptyCart",
+			},
 			SignalRises:          true,
 			SyntheticLoadReaches: true,
-			Note: "applies to EmptyCart alone. Measured endpoint rates: GetCart 0.67/s, " +
-				"AddItem 0.22/s, EmptyCart 0.03/s -- so at 100% the service-wide error " +
-				"ratio should reach roughly 3%. Expected to fail anyway: cart instruments " +
-				"gRPC as HTTP and reports status 200 even on failure, since the gRPC status " +
-				"travels in a trailer. Error ratio is structurally blind on cart",
+			Note: "three separate corrections landed on this one entry, which is why it is " +
+				"worth reading in full.\n" +
+				"  (1) It applies to EmptyCart alone, not to the cart service. Measured " +
+				"endpoint rates: GetCart 0.67/s, AddItem 0.22/s, EmptyCart 0.03/s.\n" +
+				"  (2) Measured as an absolute error rate its ceiling (~0.03/s) sat below " +
+				"the class threshold, so a total failure read as inert.\n" +
+				"  (3) Measured as a service-wide error ratio it still read inert, because " +
+				"cart instruments gRPC as HTTP and reports status 200 even on failure -- " +
+				"the gRPC status travels in a trailer. Server-side error metrics are " +
+				"structurally blind on cart.\n" +
+				"Now measured from the caller. Program.cs:60 wires the fault's store as a " +
+				"Valkey client pointed at \"badhost:1234\", and CartService's catch block " +
+				"rethrows, so the failure does reach checkout -- which calls " +
+				"oteldemo.CartService/EmptyCart at a measured 0.062/s. Same remedy as " +
+				"paymentFailure: when a service cannot show its own failure, ask its caller",
 		},
 		{
 			Flag: "emailMemoryLeak", Variant: "10000x",
