@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .agents.base import Alert, Brain, Budget, Diagnosis, Trace
+from .agents.checklist_brain import ChecklistBrain
 from .agents.random_brain import RandomBrain
 from .tools.base import Registry
 from .tools.logs import register_log_tools
@@ -51,12 +52,14 @@ def build_brain(name: str) -> Brain:
     if name == "random":
         seed = os.getenv("MEDIC_SEED")
         return RandomBrain(seed=int(seed) if seed else None)
-    # The real arms land here as they are written. Failing loudly on an unknown
-    # name matters: silently falling back to a default would mean a run labelled
-    # as one arm was actually another, and the comparison would be worthless.
+    if name == "checklist":
+        return ChecklistBrain(model=os.getenv("MEDIC_MODEL"))
+    # Failing loudly on an unknown name matters: silently falling back to a
+    # default would mean a run labelled as one arm was actually another, and the
+    # comparison would be worthless.
     raise ValueError(
-        f"unknown brain {name!r}; available: random "
-        "(checklist, oneshot, react, medic not yet implemented)"
+        f"unknown brain {name!r}; available: random, checklist "
+        "(oneshot, react, medic not yet implemented)"
     )
 
 
