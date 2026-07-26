@@ -111,11 +111,50 @@ flagd:
 
 ---
 
-## 4. 资源
+## 4. 资源与服务精简
 
-- 宿主机：24 GB / 10 核 / 244 GB 可用
-- **Docker VM 仅分配 7.75 GiB** —— OTel Demo 全量约需 6 GB，可跑但不宽裕。
-  若频繁 OOM，在 Docker Desktop 设置里上调内存，或改用 `start-minimal`
-  （去掉 `compose.full.yaml` 的 kafka / accounting / fraud-detection）。
-- 各服务 compose 里都设了 `deploy.resources.limits.memory`（如 flagd 75M、prometheus 200M）。
-  **这一点对本项目有利**：内存类故障（`emailMemoryLeak`）会真的触发限制，不是纸面故障。
+宿主机 24 GB / 10 核 / 244 GB 可用。
+
+Docker VM 默认只分到 **7.75 GiB**，全量 28 个容器实测占 **~4.3 GB**，能跑但不宽裕。
+已把 VM 提到 **12 GiB / 8 CPU**（`~/Library/Group Containers/group.com.docker/settings-store.json`
+加 `MemoryMiB: 12288`、`Cpus: 8`，重启 Docker 生效）。
+
+### 实测内存占用（全量 28 容器）
+
+| 容器 | 占用 | 容器 | 占用 |
+|---|---:|---|---:|
+| opensearch | 838 MB | grafana | 164 MB |
+| kafka | 562 MB | flagd-ui | 164 MB |
+| load-generator | 390 MB | accounting | 143 MB |
+| jaeger | 340 MB | cart | 111 MB |
+| otel-collector | 315 MB | 其余 19 个 | < 70 MB 各 |
+| ad | 223 MB | | |
+| fraud-detection | 222 MB | **合计** | **~4.3 GB** |
+| prometheus | 170 MB | | |
+
+### 只砍 2 个，不砍 4 个 —— 这是有意的
+
+`make sut-up` 用显式服务清单起 **26 个**，去掉 `flagd-ui` 和 `telemetry-docs`：
+纯 UI，对 medic 零价值，且**无任何服务依赖它们**，移除零风险。
+
+更肥的 `opensearch`(838 MB) 和 `grafana`(164 MB) **保留**，因为依赖闭包分析显示：
+
+```
+frontend-proxy  depends_on  grafana       ← 唯一的宿主机入口，不能不起
+otel-collector  depends_on  opensearch    ← 整条遥测管道的核心
+```
+
+要砍它们必须用 `!override` 改写这两个服务的 `depends_on`，
+那就是**修改被测系统本身**。
+
+> **底线：被测系统一旦被改，评测结果就失去可比性。**
+> 内存不够用「把 VM 提到 12 GiB」解决，不用「阉割被测系统」解决。
+> 省 1 GB 内存换不来一句「你这个 demo 是不是被你改坏了」。
+
+`compose.medic.yaml` 之所以只发端口、不动别的，也是这条底线。
+
+### 内存限制反而对本项目有利
+
+各服务 compose 里都设了 `deploy.resources.limits.memory`（flagd 75M、prometheus 200M 等）。
+这意味着内存类故障（`emailMemoryLeak`）会**真的触发容器限制**，
+不是纸面故障 —— 会看到真实的 OOM / 重启行为。

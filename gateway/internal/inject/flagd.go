@@ -199,6 +199,28 @@ func (in *Injector) Reset() error {
 	return writeAtomic(in.path, in.baseline)
 }
 
+// LiveVariants reads the flag file as it currently stands on disk and returns
+// each flag's effective defaultVariant.
+//
+// This deliberately reads the live file rather than the baseline: it answers
+// "what is the SUT actually configured with right now", which is how a run
+// detects state left behind by a crashed scenario.
+func LiveVariants(path string) (map[string]string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	var fs flagSet
+	if err := json.Unmarshal(b, &fs); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	out := make(map[string]string, len(fs.Flags))
+	for name, f := range fs.Flags {
+		out[name] = f.DefaultVariant
+	}
+	return out, nil
+}
+
 // rewriteTargeting replaces the outcome branches of a JsonLogic `if` rule with
 // variant, leaving the condition untouched.
 //

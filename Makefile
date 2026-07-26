@@ -36,6 +36,20 @@ DC_FILES := -f compose.yaml -f compose.full.yaml -f compose.observability.yaml \
             -f compose.extras.yaml -f ../compose.medic.yaml
 SUT_DC    = cd "$(SUT)" && $(DC) $(DC_FILES)
 
+# 显式服务清单：上游 28 个服务里去掉 flagd-ui 和 telemetry-docs。
+# 这两个是纯 UI，对 medic 零价值，且**没有任何服务依赖它们**，所以移除是安全的。
+#
+# 为什么不顺手砍掉更占内存的 grafana(164MB) 和 opensearch(838MB)：
+#   frontend-proxy depends_on grafana        —— 它是唯一的宿主机入口，不能不起
+#   otel-collector depends_on opensearch     —— 整条遥测管道的核心
+# 要砍就得用 !override 改写它们的 depends_on，那是**修改被测系统**。
+# 被测系统一旦被改，评测结果就失去可比性——这条底线比省 1 GB 内存重要。
+# 内存问题用「把 Docker VM 提到 12 GiB」解决，不用「阉割被测系统」解决。
+MEDIC_SERVICES := accounting ad astronomy-db cart checkout currency email flagd \
+                  fraud-detection frontend frontend-proxy image-provider jaeger \
+                  kafka load-generator opamp-server otel-collector payment \
+                  product-catalog prometheus quote recommendation shipping valkey-cart
+
 .PHONY: sut-fetch
 sut-fetch: ## 拉取 OpenTelemetry Demo 到 sut/（不入库）
 	@test -d "$(SUT)" || git clone --depth 1 \
@@ -47,8 +61,17 @@ sut-config: ## 干跑：校验 compose 组合能否解析（不启动任何容�
 	@$(SUT_DC) config --services
 
 .PHONY: sut-up
-sut-up: ## 启动被测系统（首次会拉十几个镜像，耗时较长）
+sut-up: ## 启动被测系统（精简服务集，26 个容器）
+	$(SUT_DC) up -d --remove-orphans $(MEDIC_SERVICES)
+
+.PHONY: sut-up-all
+sut-up-all: ## 启动上游全量 28 个服务（含 flagd-ui / telemetry-docs），排查时用
 	$(SUT_DC) up -d --remove-orphans
+
+.PHONY: sut-mem
+sut-mem: ## 按内存占用降序列出各容器
+	@docker stats --no-stream --format '{{.MemUsage}}\t{{.Name}}' \
+	  | sort -h -r | awk '{printf "%-24s %s\n", $$1" "$$2, $$3}'
 
 .PHONY: sut-down
 sut-down: ## 停止被测系统（保留数据卷）
