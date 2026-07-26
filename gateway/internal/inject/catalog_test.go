@@ -109,6 +109,8 @@ func TestFaultsUnreachableBySyntheticLoadAreFlagged(t *testing.T) {
 	want := map[string]string{
 		"imageSlowLoad":        "read by a browser component; k6 does not render pages",
 		"failedReadinessProbe": "flips a health check and never touches a request path",
+		"intlShippingSlowdown": "applies only to non-US addresses, and every entry in " +
+			"load-generator/people.json is \"United States\"",
 	}
 	for _, s := range Catalog() {
 		reason, unreachable := want[s.Flag]

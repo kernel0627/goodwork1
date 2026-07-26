@@ -43,6 +43,23 @@
 「按名字猜出来的 catalog」去建场景库，会得到一批「看起来注入了其实没生效」的假场景，
 后面所有数字都是脏的，而且**任何地方都不会报错**。
 
+### 第二轮:校验实跑又推翻了两条
+
+第一轮靠读源码纠正了 6 条。**实跑之后,又有两条被推翻** —— 而且两条都是被
+校验器抓出来的,不是靠猜。
+
+| flag | 实测 | 源码给出的定论 |
+|---|---|---|
+| `intlShippingSlowdown` | p99 前后都是 4.95ms | **合成流量下永远不可能触发。** shipping 只在地址国家**非美国**时延迟(`shipping_service.rs` 里判 `"US"｜"USA"｜"UNITED STATES"…`),而 `load-generator/people.json` 里**每一条记录的 country 都是 "United States"** |
+| `kafkaQueueProblems` | 消费滞后前后都是 0 | **我的信号选错了。** variant `on: 100` 表示每单多产 100 条消息,flag 描述说的是 **"lag spike"** —— 消费者随后就追上了。用 instant query 在注入 150 秒后采样,**尖峰早就过去了**。改成 `max_over_time` 的窗口最大值 |
+
+> **`kafkaQueueProblems` 这条是一般性教训:任何瞬时故障都必须用窗口最大值测,
+> 不能用点采样。instant query 只能看到"此刻还在发生"的故障。**
+
+`intlShippingSlowdown` 要变成可用,只有两条路:
+改 SUT 的负载数据(**放弃可比性,不做**),或者**自己发起非美国地址的订单流量**
+(可行,列为后续工作)。
+
 ### 合成流量打不到的故障
 
 两条已标记 `SyntheticLoadReaches: false`，**不进场景库**（无论校验结果如何，
@@ -70,16 +87,16 @@
 
 | # | flag | 变体 | 类别 | 根因服务 | 症状服务 | 难度 | Site（源码位置） | 合成流量可达 | 验证状态 |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | `adFailure` | on | 错误率 | ad | ad | L2 | `ad/…/AdService.java:164` (getAds) | ✅ | ⬜ |
-| 2 | `adHighCpu` | on | 资源 | ad | ad | L2 | `ad/…/AdService.java:166` | ✅ | ⬜ |
-| 3 | `adManualGc` | on | 资源→延迟 | ad | ad | **L3** | `ad/…/AdService.java:165` | ✅ | ⬜ |
-| 4 | `cartFailure` | 10–100% | 错误率 | cart | cart | L2 | `cart/…/CartService.cs:82` **仅 EmptyCart** | ✅ 但极弱 | ⬜ |
-| 5 | `emailMemoryLeak` | 1x–10000x | 资源 | email | email | **L3** | `email/email_server.rb:67` | ✅ | ⬜ |
-| 6 | `failedReadinessProbe` | on | 健康检查 | cart | cart | L1 | `cart/…/HealthCheckService.cs:36` | ❌ | ⬜ |
-| 7 | `imageSlowLoad` | 5/10sec | 延迟 | **frontend-proxy** | frontend-proxy | **L3** | `frontend/components/ProductCard/ProductCard.tsx:32` | ❌ | ⬜ |
-| 8 | `intlShippingSlowdown` | 5/10sec | 延迟 | shipping | shipping | **L3** | `shipping/src/shipping_service.rs:67` | ✅ 仅国际订单 | ⬜ |
-| 9 | `kafkaQueueProblems` | on | 队列/异步 | **checkout** | fraud-detection | **L3** | `checkout/main.go:707` | ✅ | ⬜ |
-| 10 | `paymentFailure` | 10–100% | 错误率 | payment | payment | L2 | `payment/charge.js:39` | ✅ | ⬜ |
+| 1 | `adFailure` | on | 错误率 | ad | ad | L2 | `ad/…/AdService.java:164` (getAds) | ✅ | ✅ 0→9.5% |
+| 2 | `adHighCpu` | on | 资源 | ad | ad | L2 | `ad/…/AdService.java:166` | ✅ | ✅ 1.3→18.6 核 |
+| 3 | `adManualGc` | on | 资源→延迟 | ad | ad | **L3** | `ad/…/AdService.java:165` | ✅ | ✅ p99 98→2485ms |
+| 4 | `cartFailure` | 10–100% | 错误率 | cart | cart | L2 | `cart/…/CartService.cs:82` **仅 EmptyCart** | ✅ 但极弱 | ❌ INERT (trailer) |
+| 5 | `emailMemoryLeak` | 1x–10000x | 资源 | email | email | **L3** | `email/email_server.rb:67` | ✅ | ✅ 内存 70→98% |
+| 6 | `failedReadinessProbe` | on | 健康检查 | cart | cart | L1 | `cart/…/HealthCheckService.cs:36` | ❌ | ❌ UNREACHABLE |
+| 7 | `imageSlowLoad` | 5/10sec | 延迟 | **frontend-proxy** | frontend-proxy | **L3** | `frontend/components/ProductCard/ProductCard.tsx:32` | ❌ | ❌ UNREACHABLE |
+| 8 | `intlShippingSlowdown` | 5/10sec | 延迟 | shipping | shipping | **L3** | `shipping/src/shipping_service.rs:67` | **❌ 全是美国地址** | ❌ UNREACHABLE |
+| 9 | `kafkaQueueProblems` | on | 队列/异步 | **checkout** | fraud-detection | **L3** | `checkout/main.go:707` | ✅ | 🔄 信号已改 `consumer_lag_max`，待重测 |
+| 10 | `paymentFailure` | 10–100% | 错误率 | payment | **checkout**(调用方视角) | L2 | `payment/charge.js:39` | ✅ | ✅ 调用方错误比例 0→**1.0** |
 | 11 | `paymentUnreachable` | on | 连通 | payment | **checkout** | L2 | `checkout/flags/flags_gen.go:51` | ✅ | ⬜ |
 | 12 | `productCatalogFailure` | on | 错误率 | product-catalog | product-catalog | L2 | `product-catalog/flags/flags_gen.go:29` | ✅ 仅单个商品 | ⬜ |
 | 13 | `recommendationCacheFailure` | on | **资源**（非缓存） | recommendation | recommendation | **L3** | `recommendation/recommendation_server.py:78` | ✅ | ⬜ |

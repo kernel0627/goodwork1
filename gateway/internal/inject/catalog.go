@@ -184,19 +184,30 @@ func Catalog() []Spec {
 			Signal:               "latency_p99",
 			Subs:                 map[string]string{"service": "shipping"},
 			SignalRises:          true,
-			SyntheticLoadReaches: true,
-			Note:                 "fires only for international orders, so the effect depends on the load generator producing them",
+			SyntheticLoadReaches: false,
+			Note: "unreachable under synthetic load, established from source rather than " +
+				"guessed: shipping applies the delay only when the address country is not " +
+				"US, and every entry in load-generator/people.json has country " +
+				`"United States". Measured p99 sat at 4.95ms before and after. Making it ` +
+				"reachable would mean either editing the SUT's load data, which forfeits " +
+				"comparability, or driving non-US orders from our own load source -- the " +
+				"latter is viable and left as future work",
 		},
 		{
 			Flag: "kafkaQueueProblems", Variant: "on",
 			Class: ClassQueue, RootCause: "checkout", SymptomAt: "fraud-detection", Difficulty: L3,
 			Site:                 "checkout/main.go:707",
-			Signal:               "consumer_lag",
+			Signal:               "consumer_lag_max",
+			Subs:                 map[string]string{"window": "5m"},
 			SignalRises:          true,
 			SyntheticLoadReaches: true,
 			Note: "checkout is the producer that overloads the queue, so the root cause is " +
 				"checkout rather than kafka. Crosses an async boundary: the symptom is " +
-				"consumer lag on fraud-detection and accounting, not a failing request",
+				"consumer lag on fraud-detection and accounting, not a failing request. " +
+				"Measured on instantaneous lag it read 0 before and after and was dismissed " +
+				"as inert -- the variant produces 100 extra messages per order and the " +
+				"consumers then catch up, so the burst fell between the two samples. Now " +
+				"measured as a windowed maximum, which is what any transient fault requires",
 		},
 		{
 			Flag: "paymentFailure", Variant: "100%",

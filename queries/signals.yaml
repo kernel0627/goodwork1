@@ -208,6 +208,21 @@ signals:
     min_delta: 1
     promql: sum(kafka_consumer_records_lag) or vector(0)
 
+  consumer_lag_max:
+    summary: Peak Kafka consumer lag over a window, all groups.
+    unit: records
+    min_delta: 1
+    # For a *spike*, not a level. kafkaQueueProblems sets its variant to 100,
+    # making checkout produce a hundred extra messages per order; the consumers
+    # then catch up. Measured with an instant query 150s after injection the lag
+    # read 0 both before and after, and the fault was dismissed as inert -- the
+    # burst had come and gone between the two samples.
+    #
+    # Any transient fault needs a windowed maximum rather than a point sample. An
+    # instant query only sees a fault that is still happening at the moment it
+    # runs.
+    promql: max_over_time((sum(kafka_consumer_records_lag) or vector(0))[%WINDOW%:15s])
+
   consumer_lag_by_service:
     summary: Kafka consumer lag in records for one consuming service.
     unit: records
