@@ -36,19 +36,22 @@ DC_FILES := -f compose.yaml -f compose.full.yaml -f compose.observability.yaml \
             -f compose.extras.yaml -f ../compose.medic.yaml
 SUT_DC    = cd "$(SUT)" && $(DC) $(DC_FILES)
 
-# 显式服务清单：上游 28 个服务里去掉 flagd-ui 和 telemetry-docs。
-# 这两个是纯 UI，对 medic 零价值，且**没有任何服务依赖它们**，所以移除是安全的。
+# 服务数是 28，且不可裁剪。实测（`docker compose config` 合并后的权威视图）：
 #
-# 为什么不顺手砍掉更占内存的 grafana(164MB) 和 opensearch(838MB)：
-#   frontend-proxy depends_on grafana        —— 它是唯一的宿主机入口，不能不起
-#   otel-collector depends_on opensearch     —— 整条遥测管道的核心
-# 要砍就得用 !override 改写它们的 depends_on，那是**修改被测系统**。
-# 被测系统一旦被改，评测结果就失去可比性——这条底线比省 1 GB 内存重要。
-# 内存问题用「把 Docker VM 提到 12 GiB」解决，不用「阉割被测系统」解决。
-MEDIC_SERVICES := accounting ad astronomy-db cart checkout currency email flagd \
-                  fraud-detection frontend frontend-proxy image-provider jaeger \
-                  kafka load-generator opamp-server otel-collector payment \
-                  product-catalog prometheus quote recommendation shipping valkey-cart
+#   frontend-proxy depends_on -> flagd-ui grafana telemetry-docs jaeger opamp-server frontend
+#   otel-collector depends_on -> opensearch jaeger opamp-server
+#
+# frontend-proxy 是唯一的宿主机入口(8080)，它把 flagd-ui / grafana / telemetry-docs
+# 一起拽起来；otel-collector 是遥测管道核心，它拽起 opensearch。
+# 即使在 `up` 时只列想要的服务，compose 也会按 depends_on 把这些补齐。
+#
+# 要真砍，唯一办法是用 `!override` 改写这两个服务的 depends_on，
+# 那就是**修改被测系统**。被测系统一旦被改，评测结果失去可比性，
+# 而且面试时会多一句「你这个 demo 是不是被你改坏了」——这个代价远大于省 1 GB。
+#
+# 结论：接受 28 个容器（实测 ~4.3 GB，VM 7.75 GiB，余量约 3.4 GB，够用）。
+# 真要降内存请走 Docker Desktop GUI 的 Settings → Resources，
+# 不要改 settings-store.json（见 STATUS.md 决策 D15）。
 
 .PHONY: sut-fetch
 sut-fetch: ## 拉取 OpenTelemetry Demo 到 sut/（不入库）
@@ -61,17 +64,23 @@ sut-config: ## 干跑：校验 compose 组合能否解析（不启动任何容�
 	@$(SUT_DC) config --services
 
 .PHONY: sut-up
-sut-up: ## 启动被测系统（精简服务集，26 个容器）
-	$(SUT_DC) up -d --remove-orphans $(MEDIC_SERVICES)
-
-.PHONY: sut-up-all
-sut-up-all: ## 启动上游全量 28 个服务（含 flagd-ui / telemetry-docs），排查时用
+sut-up: ## 启动被测系统（28 个容器，不可裁剪，见上方注释）
 	$(SUT_DC) up -d --remove-orphans
 
+.PHONY: sut-deps
+sut-deps: ## 打印 frontend-proxy / otel-collector 的真实合并后依赖（解释为何不可裁剪）
+	@$(SUT_DC) config 2>/dev/null | $(PY) -c "import sys,yaml; s=yaml.safe_load(sys.stdin)['services']; \
+[print(k, '->', ' '.join((s[k].get('depends_on') or {}).keys())) for k in ('frontend-proxy','otel-collector')]"
+
 .PHONY: sut-mem
-sut-mem: ## 按内存占用降序列出各容器
-	@docker stats --no-stream --format '{{.MemUsage}}\t{{.Name}}' \
-	  | sort -h -r | awk '{printf "%-24s %s\n", $$1" "$$2, $$3}'
+sut-mem: ## 按内存占用降序列出各容器，并给出合计
+	@docker stats --no-stream --format '{{.Name}}|{{.MemUsage}}' | $(PY) -c "\
+import sys; \
+rows=[l.strip().split('|') for l in sys.stdin if '|' in l]; \
+mib=lambda s: float(s.replace('GiB',''))*1024 if 'GiB' in s else float(s.replace('MiB','').replace('KiB','')); \
+p=sorted(((mib(u.split('/')[0].strip()), n, u) for n,u in rows), reverse=True); \
+[print(f'{m:9.1f} MiB  {n:<20s} (limit {u.split(\"/\")[1].strip()})') for m,n,u in p]; \
+print(f'{sum(m for m,_,_ in p):9.1f} MiB  TOTAL over {len(p)} containers')"
 
 .PHONY: sut-down
 sut-down: ## 停止被测系统（保留数据卷）

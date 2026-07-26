@@ -115,9 +115,12 @@ flagd:
 
 宿主机 24 GB / 10 核 / 244 GB 可用。
 
-Docker VM 默认只分到 **7.75 GiB**，全量 28 个容器实测占 **~4.3 GB**，能跑但不宽裕。
-已把 VM 提到 **12 GiB / 8 CPU**（`~/Library/Group Containers/group.com.docker/settings-store.json`
-加 `MemoryMiB: 12288`、`Cpus: 8`，重启 Docker 生效）。
+Docker VM 分到 **7.75 GiB / 10 CPU**，28 个容器实测占 **~4.3 GB**，余量约 3.4 GB，够用。
+
+> ⚠️ **不要试图改 `settings-store.json` 来调 VM 内存。** 实测：写入 `MemoryMiB` / `Cpus`
+> 之后 Docker Desktop 会**自行剥掉这两个 key**（不认这个 schema），而且那一次重启
+> VM 起不来（backend log 报 `no route to host` 到 `192.168.65.7:2376`），
+> 必须完全退出 Docker 再重启才恢复。要调内存只能走 GUI 的 Settings → Resources。
 
 ### 实测内存占用（全量 28 容器）
 
@@ -132,24 +135,35 @@ Docker VM 默认只分到 **7.75 GiB**，全量 28 个容器实测占 **~4.3 GB*
 | fraud-detection | 222 MB | **合计** | **~4.3 GB** |
 | prometheus | 170 MB | | |
 
-### 只砍 2 个，不砍 4 个 —— 这是有意的
+### 28 个容器不可裁剪 —— 已验证
 
-`make sut-up` 用显式服务清单起 **26 个**，去掉 `flagd-ui` 和 `telemetry-docs`：
-纯 UI，对 medic 零价值，且**无任何服务依赖它们**，移除零风险。
+一开始我以为能砍掉纯 UI 的 `flagd-ui`(164 MB)、`telemetry-docs`(10 MB)、
+`grafana`(164 MB) 和只被日志管道用到的 `opensearch`(838 MB)。**不行。**
 
-更肥的 `opensearch`(838 MB) 和 `grafana`(164 MB) **保留**，因为依赖闭包分析显示：
+用 `docker compose config`（合并后的权威视图，不是逐个文件猜）实测：
 
 ```
-frontend-proxy  depends_on  grafana       ← 唯一的宿主机入口，不能不起
-otel-collector  depends_on  opensearch    ← 整条遥测管道的核心
+frontend-proxy  depends_on -> flagd-ui  grafana  telemetry-docs  jaeger  opamp-server  frontend
+otel-collector  depends_on -> opensearch  jaeger  opamp-server
 ```
 
-要砍它们必须用 `!override` 改写这两个服务的 `depends_on`，
+`frontend-proxy` 是**唯一的宿主机入口**（8080，所有观测面都从这儿进），
+它把 flagd-ui / grafana / telemetry-docs 一起拽起来；
+`otel-collector` 是遥测管道核心，它拽起 opensearch。
+**即使 `up` 时只列想要的服务，compose 也会按 depends_on 全部补齐**（实测确认）。
+
+> **踩过的坑**：手写脚本逐个解析 compose 文件时，我让后面的文件**覆盖**了
+> `depends_on`，而 compose 实际是**合并**。于是漏掉了 `compose.yaml` 里
+> frontend-proxy 对 flagd-ui / telemetry-docs 的依赖，得出了错误结论。
+> **依赖关系一律用 `docker compose config` 取，不要自己解析 YAML。**
+> `make sut-deps` 就是干这个的。
+
+唯一能砍的办法是用 `!override` 改写这两个服务的 `depends_on` ——
 那就是**修改被测系统本身**。
 
-> **底线：被测系统一旦被改，评测结果就失去可比性。**
-> 内存不够用「把 VM 提到 12 GiB」解决，不用「阉割被测系统」解决。
+> **底线：被测系统一旦被改，评测结果失去可比性。**
 > 省 1 GB 内存换不来一句「你这个 demo 是不是被你改坏了」。
+> 4.3 GB / 7.75 GiB 有 3.4 GB 余量，够用。
 
 `compose.medic.yaml` 之所以只发端口、不动别的，也是这条底线。
 

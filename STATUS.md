@@ -55,6 +55,11 @@
 | D9 | 用本项目自己的 `sut/compose.medic.yaml` overlay 放开 Prometheus 9090 | 上游既无 ports 映射也无 Envoy 路由，PromQL 打不到。**绝不修改 SUT 仓库文件**，overlay 保持最小（只发端口），否则被测系统被改了、结果不可比 | 07-26 |
 | D10 | **不启用 `compose.agent.yaml`** | 上游自带 agent/mcp/chatbot 三个 AI 服务，会污染观测面并混淆根因归因 | 07-26 |
 | D11 | `get_service_topology` 必须由 **Jaeger 实际调用数据**生成，不得硬编码依赖图 | 硬编码等于把答案喂给 Agent，消融「关掉拓扑工具」时不公平 | 07-26 |
+| D12 | **28 个容器不可裁剪，全部保留**（此条已修正一次，见下） | `docker compose config` 实测：`frontend-proxy → flagd-ui grafana telemetry-docs jaeger opamp-server frontend`；`otel-collector → opensearch jaeger opamp-server`。frontend-proxy 是唯一宿主机入口，即使 `up` 时只列想要的服务，compose 也会按 depends_on 补齐。要砍必须 `!override` 改写 depends_on = **修改被测系统** = 结果失去可比性。4.3 GB / 7.75 GiB 有 3.4 GB 余量，够用 | 07-26 |
+| D12a | **依赖关系一律用 `docker compose config` 取，不要自己解析 YAML** | 我最初手写脚本逐文件解析，让后面的文件**覆盖**了 `depends_on`，而 compose 实际是**合并**，于是漏掉 frontend-proxy 对 flagd-ui/telemetry-docs 的依赖，得出「能砍 2 个」的错误结论。`make sut-deps` 就是这个用途 | 07-26 |
+| D13 | `injector set` 是**绝对语义而非增量**：提交的就是命令行上列出的故障集，未列出的一律回退到 baseline | 增量语义会让故障跨场景累积，第一个场景之后全部被污染 | 07-26 |
+| D14 | `query_logs` 走**容器日志**（compose 已配 json-file driver），不依赖 opensearch | 更贴近真实排障动作；且不受 collector 的 logs pipeline 是否健康影响 | 07-26 |
+| D15 | ⚠️ **不要试图用 `settings-store.json` 改 Docker VM 内存** | 实测：写入 `MemoryMiB`/`Cpus` 后 Docker Desktop 会**自行剥掉这两个 key**（不认这个 schema），且该次重启 VM 未能起来（`no route to host` 到 192.168.65.7:2376）。要调内存只能走 Docker Desktop 的 GUI 设置。已回滚，文件恢复原状 | 07-26 |
 
 ---
 
