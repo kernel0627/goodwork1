@@ -124,9 +124,31 @@
     和 **`TestCommitIsIdempotentAcrossRuns`（同一故障集在任意历史后产出相同字节）**
     是承重测试
 
+- [x] **注入器 CLI**（`gateway/cmd/injector`）：`list / set / reset / status`，端到端实测通过
+  - `set` **绝对语义**：提交的就是命令行列出的故障集，未列出的回退 baseline
+  - 区分「故障」与「实验变量」（`loadGenerator*`）—— 后者会移动指标基线，
+    必须在各对照组间固定，不能当故障注入
+  - 标出带 targeting 的 flag；拼错 variant 会报错并列出合法值
+  - 从工作目录向上找 flag 文件，仓库任意位置都能跑
+- [x] **容器精简结论已推翻并纠正**（见 D12 / D12a）：28 个不可裁剪，
+  `make sut-deps` 现在打印权威合并依赖
+- [x] **Docker VM 内存调整失败并已回滚**（见 D15）：这条路走不通，
+  要调只能走 GUI。7.75 GiB 对 4.26 GB 占用够用（`make sut-mem` 实测合计 4261 MiB / 28 容器）
+- [x] **可观测签名勘察** → `docs/faults.md` §5
+  - Prometheus 共 **524 个指标**
+  - 错误率判据：`rpc_server_duration_milliseconds_count{rpc_grpc_status_code!="0"}`
+  - 延迟：同名 `_bucket` + `le`；资源：`container_cpu_utilization_ratio`、
+    `container_memory_percent_ratio`；队列：`kafka_consumer_records_lag`
+  - **最重要的发现**：`feature_flag_evaluation_requests_total{feature_flag_key,service_name}`
+    —— flagd 自己的遥测。可以**经验性测出 flag→服务映射**（不用信描述文字），
+    并作为注入生效校验的**一级判据**
+  - 已定义**两级生效校验**：flagd 侧评估计数增长（必要）+ 下游症状偏移（充分）。
+    两级都过才算场景有效
+
 ### 🔄 进行中
 
-- [ ] **T3 收尾**：逐条注入 13 个故障，实测可观测签名，填 `docs/faults.md` 的「验证状态」列
+- [ ] **T3 收尾**：写生效校验器（Go，两级判据），逐条注入 13 个故障，
+  实测签名并填 `docs/faults.md` §2 的「验证状态」列。未验证的故障不许进场景库
 
 ### ⏳ 待办（按依赖顺序）
 

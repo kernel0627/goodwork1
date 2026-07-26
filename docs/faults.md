@@ -98,7 +98,49 @@ frontend ──┬─▶ product-catalog ◀── recommendation
 
 ---
 
-## 5. 待办
+## 5. 可观测签名 —— 实测的指标与 PromQL
+
+Prometheus 里共 **524 个指标**。验证故障是否生效、以及 Agent 诊断时要查什么，
+都落在下面这几组上。
+
+### 关键标签（实测）
+
+| 指标 | 关键标签 | 用途 |
+|---|---|---|
+| `rpc_server_duration_milliseconds_count` | **`rpc_grpc_status_code`**、`service_name`、`rpc_method`、`rpc_service` | gRPC 错误率与调用量。`status_code != "0"` 即错误 |
+| `rpc_server_duration_milliseconds_bucket` | 同上 + `le` | 延迟分位数 |
+| `http_server_*` / `http_client_*` | `service_name`、`http_*` | HTTP 侧同理 |
+| `container_cpu_utilization_ratio` | 容器标签 | 资源类故障（`adHighCpu`） |
+| `container_memory_percent_ratio` | 容器标签 | 资源类故障（`emailMemoryLeak`） |
+| `kafka_consumer_records_lag` / `kafka_consumer_group_lag_*` | consumer group | 队列类故障（`kafkaQueueProblems`） |
+| **`feature_flag_evaluation_requests_total`** | **`feature_flag_key`**、`service_name` | 见下 |
+
+### `feature_flag_evaluation_requests_total` 是生效校验的最强判据
+
+flagd 的 OTel 遥测带 `feature_flag_key` 和 `service_name` 两个标签。这给了两个能力：
+
+1. **经验性地测出 flag → 服务的映射**，不用从 flag 描述文字猜。
+   §2 表里「根因服务」一列应当用这个指标核对，而不是信描述。
+2. **确认某服务确实在评估这个 flag**。注入后如果该 flag 的评估计数没有增长，
+   说明根本没有服务在读它 —— 场景无效，直接作废。
+
+> 注意：实测当前只有 `cartFailure` 和 `failedReadinessProbe` 两个 key 有数据，
+> 因为只有真正去查 flag 的服务才会上报。这本身就是信息：
+> **注入前后对比这个指标，才知道注入通道是否打通。**
+
+### 生效校验的两级判据
+
+```
+一级（必要）：flagd 侧    feature_flag_evaluation_requests_total{feature_flag_key="X"} 有增长
+二级（充分）：下游症状    对应的错误率 / 延迟 / 资源指标出现预期偏移
+```
+
+两级都过才算场景有效。只过一级说明 flag 读到了但没生效；
+只过二级说明症状可能来自别的原因（噪声、其他故障残留）。
+
+---
+
+## 6. 待办
 
 - [ ] 逐条注入验证，填「验证状态」列，记录每条故障在 Prometheus 上的**实际可观测签名**
 - [ ] 确认 `failedReadinessProbe` 作用于哪个服务（配置里未直接体现，需实测）
