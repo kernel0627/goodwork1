@@ -1,10 +1,8 @@
 package inject
 
-import "fmt"
-
 // Class groups faults by the shape of the symptom they produce. The agent's
-// hardest cases are the ones where class and symptom disagree -- a cache
-// failure that shows up as latency rather than errors, for instance.
+// hardest cases are the ones where class and symptom disagree -- a leak named
+// after a cache, for instance.
 type Class string
 
 const (
@@ -14,7 +12,6 @@ const (
 	ClassConnectivity Class = "connectivity"
 	ClassHealth       Class = "health"
 	ClassQueue        Class = "queue"
-	ClassCache        Class = "cache"
 )
 
 // Difficulty is how far the symptom sits from the root cause.
@@ -33,10 +30,10 @@ const (
 
 // Spec describes one injectable fault and how to tell whether it actually fired.
 //
-// The verification queries exist because a fault that fails to take effect
+// The verification signal exists because a fault that fails to take effect
 // produces a scenario that looks injected but is not. Such a scenario silently
-// scores the agent on a healthy system, which corrupts results with no visible
-// failure anywhere.
+// scores the agent against a healthy system, which corrupts results with no
+// visible failure anywhere.
 type Spec struct {
 	Flag    string
 	Variant string // severity used for characterisation: the most extreme one
@@ -46,18 +43,19 @@ type Spec struct {
 	SymptomAt  string // service where the symptom is expected to surface
 	Difficulty Difficulty
 
-	// Effect is PromQL whose value should move once the fault fires.
-	Effect string
-	// EffectRises says which way. All current faults make things worse, but
-	// stating it explicitly keeps the verifier honest about direction.
-	EffectRises bool
+	// Signal names an entry in queries/signals.yaml, and Subs supplies its
+	// placeholders. Queries are not written inline here: the Python tool layer
+	// needs the same ones, and duplicating them means duplicating the mistakes
+	// (see the file's header for what those cost).
+	Signal string
+	Subs   map[string]string
 
-	// MinDeltaOverride replaces the per-class threshold when a fault's ceiling
-	// is known to sit below it. cartFailure is the motivating case: it only
-	// affects EmptyCart, which the load generator calls about once every 30
-	// seconds, so the largest error rate it can possibly produce is ~0.03/s --
-	// under the 0.05/s class floor. With the class default this fault reads as
-	// inert no matter how hard it is actually failing.
+	// SignalRises says which way the value should move. Every fault here makes
+	// things worse, but stating it keeps the verifier honest about direction.
+	SignalRises bool
+
+	// MinDeltaOverride replaces the signal's own threshold. Rarely needed now
+	// that faults are measured as ratios rather than absolute rates.
 	MinDeltaOverride float64
 
 	// Site is where the flag is read in the SUT's source. Recorded because the
@@ -89,34 +87,40 @@ type Spec struct {
 // check and never touches a request.
 //
 // A fault's blast radius and observable signature are properties of the code
-// that reads the flag. They cannot be inferred from its name. Each Spec below
-// therefore records the Site it was read from, so a disputed verdict is checked
-// against source rather than against intuition.
+// that reads the flag. They cannot be inferred from its name. Each Spec records
+// the Site it was read from, so a disputed verdict is checked against source
+// rather than against intuition.
 func Catalog() []Spec {
 	return []Spec{
 		{
 			Flag: "adFailure", Variant: "on",
 			Class: ClassError, RootCause: "ad", SymptomAt: "ad", Difficulty: L2,
 			Site:                 "ad/src/main/java/oteldemo/AdService.java:164 (getAds)",
-			Effect:               errorRate("ad"),
-			EffectRises:          true,
+			Signal:               "error_ratio",
+			Subs:                 map[string]string{"service": "ad"},
+			SignalRises:          true,
 			SyntheticLoadReaches: true,
-			Note:                 "getAds is on the hot path for every product page, so this is the strongest error signal available",
+			Note: "getAds is on the hot path for every product page. Measured as an absolute " +
+				"rate this fault moved the needle only 0.0167/s and was dismissed as inert, " +
+				"because ad serves just 0.23 req/s; as a ratio the same failure is ~7%",
 		},
 		{
 			Flag: "adHighCpu", Variant: "on",
 			Class: ClassResource, RootCause: "ad", SymptomAt: "ad", Difficulty: L2,
 			Site:                 "ad/src/main/java/oteldemo/AdService.java:166 (getAds)",
-			Effect:               containerCPU("ad"),
-			EffectRises:          true,
+			Signal:               "cpu",
+			Subs:                 map[string]string{"container": "ad"},
+			SignalRises:          true,
 			SyntheticLoadReaches: true,
+			Note:                 "ad idles around 1.6 cores, so the threshold is in cores rather than a fraction",
 		},
 		{
 			Flag: "adManualGc", Variant: "on",
 			Class: ClassResource, RootCause: "ad", SymptomAt: "ad", Difficulty: L3,
 			Site:                 "ad/src/main/java/oteldemo/AdService.java:165 (getAds)",
-			Effect:               latencyP99("ad"),
-			EffectRises:          true,
+			Signal:               "latency_p99",
+			Subs:                 map[string]string{"service": "ad"},
+			SignalRises:          true,
 			SyntheticLoadReaches: true,
 			Note:                 "forced full GCs surface as periodic latency spikes; a p99 over a 2m window may smooth them away",
 		},
@@ -124,59 +128,62 @@ func Catalog() []Spec {
 			Flag: "cartFailure", Variant: "100%",
 			Class: ClassError, RootCause: "cart", SymptomAt: "cart", Difficulty: L2,
 			Site:                 "cart/src/services/CartService.cs:82 (EmptyCart only)",
-			Effect:               errorRate("cart"),
-			EffectRises:          true,
-			MinDeltaOverride:     0.01,
+			Signal:               "error_ratio",
+			Subs:                 map[string]string{"service": "cart"},
+			SignalRises:          true,
 			SyntheticLoadReaches: true,
-			Note: "applies to EmptyCart alone, which the load generator calls at ~0.03/s -- " +
-				"measured GetCart 0.67/s, AddItem 0.22/s, EmptyCart 0.03/s. The fault's " +
-				"ceiling is therefore below the class threshold, hence the override. " +
-				"Also worth knowing: cart routes the request to a deliberately broken " +
-				"store rather than throwing, so the failure may not appear as a status code at all",
+			Note: "applies to EmptyCart alone. Measured endpoint rates: GetCart 0.67/s, " +
+				"AddItem 0.22/s, EmptyCart 0.03/s -- so at 100% the service-wide error " +
+				"ratio should reach roughly 3%. Expected to fail anyway: cart instruments " +
+				"gRPC as HTTP and reports status 200 even on failure, since the gRPC status " +
+				"travels in a trailer. Error ratio is structurally blind on cart",
 		},
 		{
 			Flag: "emailMemoryLeak", Variant: "10000x",
 			Class: ClassResource, RootCause: "email", SymptomAt: "email", Difficulty: L3,
 			Site:                 "email/email_server.rb:67",
-			Effect:               containerMemory("email"),
-			EffectRises:          true,
+			Signal:               "memory",
+			Subs:                 map[string]string{"container": "email"},
+			SignalRises:          true,
 			SyntheticLoadReaches: true,
-			Note: "email has a container memory limit, so a large enough leak should reach OOM " +
-				"rather than merely trend upward. email is only called during checkout, " +
-				"so the leak accrues at checkout rate",
+			Note: "email reports no server-side request metrics at all (measured 0.000 req/s), " +
+				"so container memory is the only available signal. It has a memory limit, so " +
+				"a large enough leak should reach OOM rather than merely trend upward",
 		},
 		{
 			Flag: "failedReadinessProbe", Variant: "on",
 			Class: ClassHealth, RootCause: "cart", SymptomAt: "cart", Difficulty: L1,
 			Site:                 "cart/src/services/HealthCheckService.cs:36 (readinessCheck)",
-			Effect:               errorRate("cart"),
-			EffectRises:          true,
+			Signal:               "error_ratio",
+			Subs:                 map[string]string{"service": "cart"},
+			SignalRises:          true,
 			SyntheticLoadReaches: false,
 			Note: "returns HealthCheckResult.Unhealthy and never touches a request path, so " +
 				"request metrics are the wrong place to look. The real signal is the gRPC " +
 				"health endpoint and the container's health state, neither of which reaches " +
-				"Prometheus. Needs a container-level probe; the Effect query here is a " +
-				"placeholder and is expected to read inert",
+				"Prometheus. This Signal is a placeholder and is expected to read inert",
 		},
 		{
 			Flag: "imageSlowLoad", Variant: "10sec",
 			Class: ClassLatency, RootCause: "frontend-proxy", SymptomAt: "frontend-proxy", Difficulty: L3,
 			Site:                 "frontend/components/ProductCard/ProductCard.tsx:32",
-			Effect:               latencyP99("frontend-proxy"),
-			EffectRises:          true,
+			Signal:               "latency_p99",
+			Subs:                 map[string]string{"service": "frontend-proxy"},
+			SignalRises:          true,
 			SyntheticLoadReaches: false,
 			Note: "not an image-provider fault. The browser component reads the flag and sets " +
 				"an x-envoy-fault-delay-request header; Envoy applies the delay. The header " +
 				"only exists if a browser renders ProductCard, and the k6 load generator " +
 				"issues HTTP requests without rendering, so synthetic traffic probably never " +
-				"triggers it. Expected to be unusable without a browser-driving load source",
+				"triggers it",
 		},
 		{
 			Flag: "intlShippingSlowdown", Variant: "10sec",
 			Class: ClassLatency, RootCause: "shipping", SymptomAt: "shipping", Difficulty: L3,
 			Site:                 "shipping/src/shipping_service.rs:67",
-			Effect:               latencyP99("shipping"),
-			EffectRises:          true,
+			Signal:               "latency_p99",
+			Subs:                 map[string]string{"service": "shipping"},
+			SignalRises:          true,
 			SyntheticLoadReaches: true,
 			Note:                 "fires only for international orders, so the effect depends on the load generator producing them",
 		},
@@ -184,8 +191,8 @@ func Catalog() []Spec {
 			Flag: "kafkaQueueProblems", Variant: "on",
 			Class: ClassQueue, RootCause: "checkout", SymptomAt: "fraud-detection", Difficulty: L3,
 			Site:                 "checkout/main.go:707",
-			Effect:               "sum(kafka_consumer_records_lag) or vector(0)",
-			EffectRises:          true,
+			Signal:               "consumer_lag",
+			SignalRises:          true,
 			SyntheticLoadReaches: true,
 			Note: "checkout is the producer that overloads the queue, so the root cause is " +
 				"checkout rather than kafka. Crosses an async boundary: the symptom is " +
@@ -193,122 +200,58 @@ func Catalog() []Spec {
 		},
 		{
 			Flag: "paymentFailure", Variant: "100%",
-			Class: ClassError, RootCause: "payment", SymptomAt: "payment", Difficulty: L2,
-			Site:                 "payment/charge.js:39 (throws on charge)",
-			Effect:               errorRate("payment"),
-			EffectRises:          true,
+			Class: ClassError, RootCause: "payment", SymptomAt: "checkout", Difficulty: L2,
+			Site:   "payment/charge.js:39 (throws on charge)",
+			Signal: "client_error_ratio",
+			Subs: map[string]string{
+				"caller":      "checkout",
+				"rpc_pattern": "oteldemo.PaymentService/.*",
+			},
+			SignalRises:          true,
 			SyntheticLoadReaches: true,
-			Note:                 "charge runs once per checkout, so the achievable rate is the checkout rate, not the request rate",
+			Note: "payment reports no server-side metrics whatsoever (measured 0.000 req/s), so " +
+				"its own failure is invisible from its own instrumentation. Measured from " +
+				"the caller instead: checkout calls oteldemo.PaymentService/Charge at " +
+				"0.062/s. This is also how an oncall would establish that payment is down",
 		},
 		{
 			Flag: "paymentUnreachable", Variant: "on",
 			Class: ClassConnectivity, RootCause: "payment", SymptomAt: "checkout", Difficulty: L2,
 			Site:                 "checkout/flags/flags_gen.go:51 (read by checkout, not payment)",
-			Effect:               errorRate("checkout"),
-			EffectRises:          true,
+			Signal:               "error_ratio",
+			Subs:                 map[string]string{"service": "checkout"},
+			SignalRises:          true,
 			SyntheticLoadReaches: true,
 			Note: "checkout reads the flag and refuses to reach payment, so the symptom is on " +
-				"the caller while the named service is the one that looks absent -- a clean " +
-				"case of symptom service != root cause service",
+				"the caller while the named service merely looks absent -- a clean case of " +
+				"symptom service != root cause service. Measured on checkout's own error " +
+				"ratio rather than its client view, since the call may not be attempted at all",
 		},
 		{
 			Flag: "productCatalogFailure", Variant: "on",
 			Class: ClassError, RootCause: "product-catalog", SymptomAt: "product-catalog", Difficulty: L2,
 			Site:                 "product-catalog/flags/flags_gen.go:29",
-			Effect:               errorRate("product-catalog"),
-			EffectRises:          true,
-			MinDeltaOverride:     0.01,
+			Signal:               "error_ratio",
+			Subs:                 map[string]string{"service": "product-catalog"},
+			SignalRises:          true,
 			SyntheticLoadReaches: true,
 			Note: "the targeting rule scopes this to product OLJCESPC7Z, so only requests for " +
-				"that one product fail and the error rate stays low by design -- a weak " +
-				"signal on purpose, which makes it a good test of whether the agent notices",
+				"that one product fail. product-catalog serves 3.09 req/s, the busiest " +
+				"backend, so the ratio stays low by design -- which makes it a good test of " +
+				"whether the agent notices a weak signal",
 		},
 		{
 			Flag: "recommendationCacheFailure", Variant: "on",
 			Class: ClassResource, RootCause: "recommendation", SymptomAt: "recommendation", Difficulty: L3,
 			Site:                 "recommendation/recommendation_server.py:78",
-			Effect:               containerMemory("recommendation"),
-			EffectRises:          true,
+			Signal:               "memory",
+			Subs:                 map[string]string{"container": "recommendation"},
+			SignalRises:          true,
 			SyntheticLoadReaches: true,
 			Note: "despite the name this is a memory leak, not a cache miss problem: on each " +
 				"miss the code appends a quarter of cached_ids back onto itself, so the list " +
-				"grows without bound. Class is resource, not cache. A secondary signal is " +
-				"an elevated ListProducts call rate against product-catalog",
+				"grows without bound. Class is resource, not cache. recommendation also " +
+				"reports no server-side request metrics, so memory is the only signal",
 		},
 	}
-}
-
-// EvaluationQuery is the tier-1 check: does any service actually evaluate this
-// flag?
-//
-// This is a static property, not a before/after delta. The load generator keeps
-// traffic flowing, so services consult their flags continuously whether or not
-// a fault is injected; the counter is already climbing before injection. What
-// the counter tells us is whether anything reads the flag at all. A flag with
-// no evaluations cannot possibly fire, so a scenario built on it is invalid
-// regardless of what downstream metrics happen to show.
-func EvaluationQuery(flagName string) string {
-	return fmt.Sprintf(
-		`sum(rate(feature_flag_evaluation_requests_total{feature_flag_key=%q}[5m])) or vector(0)`,
-		flagName)
-}
-
-// EvaluatingServicesQuery finds which services evaluate a flag, so the
-// RootCause guesses above can be checked against measurement instead of
-// against the flag's prose description.
-func EvaluatingServicesQuery(flagName string) string {
-	return fmt.Sprintf(
-		`feature_flag_evaluation_requests_total{feature_flag_key=%q}`, flagName)
-}
-
-// errorRate sums server-side failures for a service.
-//
-// Three terms are needed because the demo is polyglot: gRPC services report
-// rpc_grpc_status_code, while HTTP services split across two semantic
-// conventions -- older SDKs emit http_status_code on
-// http_server_duration_milliseconds, newer ones emit http_response_status_code
-// on http_server_request_duration_seconds. Covering only one would make some
-// services look permanently healthy.
-//
-// `or vector(0)` supplies a zero for terms with no series, since sum() over an
-// empty vector yields an empty vector and would otherwise void the whole
-// expression.
-func errorRate(service string) string {
-	return fmt.Sprintf(`
-(sum(rate(rpc_server_duration_milliseconds_count{service_name=%[1]q,rpc_grpc_status_code!="0"}[2m])) or vector(0))
-+ (sum(rate(http_server_duration_milliseconds_count{service_name=%[1]q,http_status_code=~"5.."}[2m])) or vector(0))
-+ (sum(rate(http_server_request_duration_seconds_count{service_name=%[1]q,http_response_status_code=~"5.."}[2m])) or vector(0))`,
-		service)
-}
-
-// latencyP99 is the 99th percentile server latency in milliseconds.
-//
-// Three histogram families are covered for the same polyglot reason as
-// errorRate, and the seconds-based one is scaled up so all three are in the
-// same unit. `or` picks whichever family the service actually reports.
-//
-// The single `or vector(0)` sits at the very end, and that placement is
-// load bearing. Writing `(A or vector(0)) or B` would short-circuit: the first
-// term always yields something -- A when it exists, otherwise 0 -- so B would
-// never be consulted, and every service that reports only the later families
-// would measure a flat zero and make a working latency fault look inert.
-func latencyP99(service string) string {
-	return fmt.Sprintf(`
-max(
-  histogram_quantile(0.99, sum by (le) (rate(rpc_server_duration_milliseconds_bucket{service_name=%[1]q}[2m])))
-  or
-  histogram_quantile(0.99, sum by (le) (rate(http_server_duration_milliseconds_bucket{service_name=%[1]q}[2m])))
-  or
-  1000 * histogram_quantile(0.99, sum by (le) (rate(http_server_request_duration_seconds_bucket{service_name=%[1]q}[2m])))
-) or vector(0)`, service)
-}
-
-// containerCPU and containerMemory key off container_name, which is the label
-// the container metrics carry -- they have no service_name.
-func containerCPU(container string) string {
-	return fmt.Sprintf(`max(container_cpu_utilization_ratio{container_name=%q}) or vector(0)`, container)
-}
-
-func containerMemory(container string) string {
-	return fmt.Sprintf(`max(container_memory_percent_ratio{container_name=%q}) or vector(0)`, container)
 }

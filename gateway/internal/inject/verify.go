@@ -6,19 +6,29 @@ import (
 	"math"
 	"time"
 
+	"github.com/kernel0627/medic/gateway/internal/dockerlog"
 	"github.com/kernel0627/medic/gateway/internal/promq"
+	"github.com/kernel0627/medic/gateway/internal/signals"
 )
 
 // Verdict is the outcome of characterising one fault.
 type Verdict struct {
 	Spec Spec
 
-	// Tier 1 -- can this fault fire at all?
+	// Tier 1 -- did flagd take the injection?
+	ReloadObserved bool
+	ReloadEvidence []string
+	// EvalRate and EvaluatingServices are supporting evidence, not a criterion.
+	// flagd's OpenTelemetry flag-evaluation metric is emitted by only one
+	// service in this SUT, so its absence proves nothing.
 	EvalRate           float64
 	EvaluatingServices []string
 	Tier1Pass          bool
 
 	// Tier 2 -- did the expected signal actually move?
+	Signal    string
+	Unit      string
+	Query     string
 	Before    float64
 	After     float64
 	Delta     float64
@@ -31,11 +41,16 @@ type Verdict struct {
 
 // Valid reports whether the fault is fit to build scenarios on.
 //
-// Both tiers must hold. Tier 1 alone means the flag is read but changes
-// nothing. Tier 2 alone means the signal moved for some other reason -- noise,
-// or residue from a previous scenario -- and attributing it to this fault would
-// be wrong.
-func (v Verdict) Valid() bool { return v.Err == nil && v.Tier1Pass && v.Tier2Pass }
+// Both tiers must hold. Tier 1 alone means flagd took the file but nothing
+// downstream changed. Tier 2 alone means the signal moved for some other reason
+// -- noise, or residue from a previous scenario -- and attributing it to this
+// fault would be wrong.
+//
+// Faults synthetic load cannot reach are excluded regardless: no traffic would
+// ever trigger them, so however they verify is beside the point.
+func (v Verdict) Valid() bool {
+	return v.Err == nil && v.Tier1Pass && v.Tier2Pass && v.Spec.SyntheticLoadReaches
+}
 
 // Status renders a short reason, which is the part worth reading when a fault
 // turns out not to work.
@@ -43,12 +58,14 @@ func (v Verdict) Status() string {
 	switch {
 	case v.Err != nil:
 		return "ERROR: " + v.Err.Error()
+	case !v.Spec.SyntheticLoadReaches:
+		return "UNREACHABLE: synthetic load cannot drive this code path"
 	case !v.Tier1Pass && !v.Tier2Pass:
-		return "DEAD: no service evaluates the flag, and no signal moved"
+		return "DEAD: flagd never saw the file change, and no signal moved"
 	case !v.Tier1Pass:
-		return "SUSPECT: signal moved but no service evaluates the flag (likely noise)"
+		return "SUSPECT: signal moved but flagd logged no reload (likely noise)"
 	case !v.Tier2Pass:
-		return "INERT: flag is evaluated but the expected signal did not move"
+		return "INERT: flagd took the file but the expected signal did not move"
 	default:
 		return "OK"
 	}
@@ -56,8 +73,9 @@ func (v Verdict) Status() string {
 
 // Verifier characterises faults against the live SUT.
 type Verifier struct {
-	Inj  *Injector
-	Prom *promq.Client
+	Inj     *Injector
+	Prom    *promq.Client
+	Signals *signals.Catalog
 
 	// Settle is how long to wait after injecting before measuring. It must
 	// cover flagd's file reload plus the collector's export interval plus the
@@ -71,7 +89,7 @@ type Verifier struct {
 }
 
 // DefaultSettle and DefaultRecover are deliberately generous. The rate()
-// windows in the catalog are 2m, so a shorter settle would measure a period
+// windows in signals.yaml are 2m, so a shorter settle would measure a period
 // that is mostly pre-injection and systematically under-report every fault.
 const (
 	DefaultSettle  = 150 * time.Second
@@ -82,21 +100,39 @@ const (
 // measure again, then revert.
 func (v *Verifier) Verify(ctx context.Context, spec Spec) Verdict {
 	start := time.Now()
-	out := Verdict{Spec: spec, MinDelta: thresholdFor(spec)}
+	out := Verdict{Spec: spec, Signal: spec.Signal}
 	defer func() { out.Elapsed = time.Since(start) }()
 
-	// Tier 1 first: if nothing evaluates the flag, injecting proves nothing
-	// and there is no reason to spend minutes waiting.
-	rate, err := v.Prom.Instant(ctx, EvaluationQuery(spec.Flag))
-	if err != nil {
-		out.Err = fmt.Errorf("tier-1 query: %w", err)
+	sig, ok := v.Signals.Get(spec.Signal)
+	if !ok {
+		out.Err = fmt.Errorf("signal %q not in queries/signals.yaml", spec.Signal)
 		return out
 	}
-	out.EvalRate = zeroIfNoData(rate)
-	out.Tier1Pass = out.EvalRate > 0
+	out.Unit = sig.Unit
+	out.MinDelta = sig.MinDelta
+	if spec.MinDeltaOverride > 0 {
+		out.MinDelta = spec.MinDeltaOverride
+	}
+	if out.MinDelta <= 0 {
+		out.Err = fmt.Errorf("signal %q has no usable threshold; any noise would pass", spec.Signal)
+		return out
+	}
 
+	query, err := v.Signals.Query(spec.Signal, spec.Subs)
+	if err != nil {
+		out.Err = err
+		return out
+	}
+	out.Query = query
+
+	// Supporting evidence, gathered before anything is disturbed.
+	if rate, err := v.Prom.Instant(ctx, v.Signals.MustQuery(
+		"flag_evaluations", map[string]string{"flag": spec.Flag})); err == nil {
+		out.EvalRate = zeroIfNoData(rate)
+	}
 	if svcs, err := v.Prom.LabelValues(ctx, "service_name",
-		EvaluatingServicesQuery(spec.Flag)); err == nil {
+		fmt.Sprintf(`feature_flag_evaluation_requests_total{feature_flag_key=%q}`, spec.Flag),
+	); err == nil {
 		out.EvaluatingServices = svcs
 	}
 
@@ -110,12 +146,16 @@ func (v *Verifier) Verify(ctx context.Context, spec Spec) Verdict {
 		return out
 	}
 
-	before, err := v.Prom.Instant(ctx, spec.Effect)
+	before, err := v.Prom.Instant(ctx, query)
 	if err != nil {
 		out.Err = fmt.Errorf("baseline measurement: %w", err)
 		return out
 	}
 	out.Before = zeroIfNoData(before)
+
+	// Mark the log position just before writing, so the reload check cannot be
+	// satisfied by an event from an earlier scenario.
+	injectAt := time.Now().Add(-2 * time.Second)
 
 	v.Inj.ClearAll()
 	if err := v.Inj.Set(spec.Flag, spec.Variant); err != nil {
@@ -140,7 +180,16 @@ func (v *Verifier) Verify(ctx context.Context, spec Spec) Verdict {
 		return out
 	}
 
-	after, err := v.Prom.Instant(ctx, spec.Effect)
+	reloaded, evidence, err := dockerlog.FlagdReloaded(ctx, injectAt)
+	if err != nil {
+		out.Err = fmt.Errorf("tier-1 reload check: %w", err)
+		return out
+	}
+	out.ReloadObserved = reloaded
+	out.ReloadEvidence = evidence
+	out.Tier1Pass = reloaded
+
+	after, err := v.Prom.Instant(ctx, query)
 	if err != nil {
 		out.Err = fmt.Errorf("post-injection measurement: %w", err)
 		return out
@@ -148,7 +197,7 @@ func (v *Verifier) Verify(ctx context.Context, spec Spec) Verdict {
 	out.After = zeroIfNoData(after)
 	out.Delta = out.After - out.Before
 
-	if spec.EffectRises {
+	if spec.SignalRises {
 		out.Tier2Pass = out.Delta >= out.MinDelta
 	} else {
 		out.Tier2Pass = -out.Delta >= out.MinDelta
@@ -174,40 +223,6 @@ func (v *Verifier) VerifyAll(ctx context.Context, specs []Spec, onResult func(in
 		}
 	}
 	return out
-}
-
-// thresholdFor resolves the tier-2 threshold, preferring a fault's own override.
-//
-// Overrides exist because a class floor can sit above what a fault is capable
-// of producing. cartFailure only affects EmptyCart, which synthetic traffic
-// calls about once every 30 seconds, so its ceiling is roughly 0.03 failures
-// per second against a 0.05 class floor: with the default it reads as inert no
-// matter how completely it is failing.
-func thresholdFor(s Spec) float64 {
-	if s.MinDeltaOverride > 0 {
-		return s.MinDeltaOverride
-	}
-	return minDelta(s.Class)
-}
-
-// minDelta is the smallest change worth calling an effect, per fault class.
-//
-// A pure relative threshold does not work here: error rates sit at zero when
-// healthy, so any relative test either divides by zero or fires on noise.
-// These are absolute floors in each metric's own units.
-func minDelta(c Class) float64 {
-	switch c {
-	case ClassError, ClassConnectivity, ClassHealth:
-		return 0.05 // failed requests per second
-	case ClassLatency, ClassCache:
-		return 50 // milliseconds at p99
-	case ClassResource:
-		return 0.05 // utilisation ratio, i.e. 5 percentage points
-	case ClassQueue:
-		return 1 // records of consumer lag
-	default:
-		return 0
-	}
 }
 
 // zeroIfNoData folds an empty result set to zero.

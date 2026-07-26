@@ -26,8 +26,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kernel0627/medic/gateway/internal/dockerlog"
 	"github.com/kernel0627/medic/gateway/internal/inject"
 	"github.com/kernel0627/medic/gateway/internal/promq"
+	"github.com/kernel0627/medic/gateway/internal/signals"
 )
 
 const defaultFlagPath = "sut/opentelemetry-demo/src/flagd/demo.flagd.json"
@@ -55,6 +57,16 @@ func main() {
 	if err := prom.Ready(ctx); err != nil {
 		die(fmt.Errorf("prometheus at %s not answering: %w\nrun `make sut-up` first", *promURL, err))
 	}
+	// Tier-1 verification reads flagd's container log, so the docker CLI has to
+	// be reachable. Checked here rather than discovered 50 minutes into a run.
+	if err := dockerlog.Available(ctx); err != nil {
+		die(err)
+	}
+
+	sigs, err := signals.Load(filepath.Join(root, signals.DefaultPath))
+	if err != nil {
+		die(err)
+	}
 
 	inj, err := inject.New(flagPath)
 	if err != nil {
@@ -74,7 +86,10 @@ func main() {
 		len(specs), *settle, *recover)
 	fmt.Printf("estimated wall clock: ~%s\n\n", (time.Duration(len(specs)) * perFault).Round(time.Minute))
 
-	verifier := &inject.Verifier{Inj: inj, Prom: prom, Settle: *settle, Recover: *recover}
+	verifier := &inject.Verifier{
+		Inj: inj, Prom: prom, Signals: sigs,
+		Settle: *settle, Recover: *recover,
+	}
 
 	verdicts := verifier.VerifyAll(ctx, specs, func(i, n int, v inject.Verdict) {
 		mark := "ok  "
@@ -100,7 +115,8 @@ func main() {
 		os.Exit(130)
 	}
 	for _, v := range verdicts {
-		if !v.Valid() {
+		// Faults excluded by design are not failures; everything else is.
+		if !v.Valid() && v.Spec.SyntheticLoadReaches {
 			// A non-zero exit makes an incomplete catalog impossible to
 			// overlook when this runs from a script.
 			os.Exit(1)
@@ -109,11 +125,13 @@ func main() {
 }
 
 func summarise(verdicts []inject.Verdict) {
-	var valid, inert, dead, suspect, errored []string
+	var valid, inert, dead, suspect, errored, unreachable []string
 	for _, v := range verdicts {
 		switch {
 		case v.Err != nil:
 			errored = append(errored, v.Spec.Flag)
+		case !v.Spec.SyntheticLoadReaches:
+			unreachable = append(unreachable, v.Spec.Flag)
 		case v.Valid():
 			valid = append(valid, v.Spec.Flag)
 		case !v.Tier1Pass && !v.Tier2Pass:
@@ -132,6 +150,7 @@ func summarise(verdicts []inject.Verdict) {
 		}
 	}
 	report("usable", valid)
+	report("unreach", unreachable)
 	report("inert", inert)
 	report("suspect", suspect)
 	report("dead", dead)
@@ -139,31 +158,39 @@ func summarise(verdicts []inject.Verdict) {
 
 	if len(valid) < len(verdicts) {
 		fmt.Println("\nOnly faults marked usable may enter the scenario library.")
-		fmt.Println("For the rest, fix the Effect query in internal/inject/catalog.go")
-		fmt.Println("or drop the fault -- do not build scenarios on unverified faults.")
+		fmt.Println("  unreach  no synthetic traffic drives the code path; excluded by design")
+		fmt.Println("  inert    flagd took the file but nothing moved -- wrong signal, or the")
+		fmt.Println("           fault's ceiling is below the threshold in queries/signals.yaml")
+		fmt.Println("  suspect  something moved without flagd reloading; probably noise")
+		fmt.Println("Fix the signal or drop the fault. Do not build scenarios on unverified faults.")
 	}
 }
 
 type record struct {
-	Flag               string   `json:"flag"`
-	Variant            string   `json:"variant"`
-	Class              string   `json:"class"`
-	RootCause          string   `json:"root_cause"`
-	SymptomAt          string   `json:"symptom_at"`
-	Difficulty         string   `json:"difficulty"`
-	EvalRate           float64  `json:"eval_rate"`
-	EvaluatingServices []string `json:"evaluating_services"`
-	Tier1Pass          bool     `json:"tier1_pass"`
-	Before             float64  `json:"before"`
-	After              float64  `json:"after"`
-	Delta              float64  `json:"delta"`
-	MinDelta           float64  `json:"min_delta"`
-	Tier2Pass          bool     `json:"tier2_pass"`
-	Valid              bool     `json:"valid"`
-	Status             string   `json:"status"`
-	Effect             string   `json:"effect_query"`
-	Note               string   `json:"note,omitempty"`
-	ElapsedSeconds     float64  `json:"elapsed_seconds"`
+	Flag                 string   `json:"flag"`
+	Variant              string   `json:"variant"`
+	Class                string   `json:"class"`
+	RootCause            string   `json:"root_cause"`
+	SymptomAt            string   `json:"symptom_at"`
+	Difficulty           string   `json:"difficulty"`
+	Site                 string   `json:"source_site"`
+	SyntheticLoadReaches bool     `json:"synthetic_load_reaches"`
+	ReloadObserved       bool     `json:"reload_observed"`
+	EvalRate             float64  `json:"eval_rate"`
+	EvaluatingServices   []string `json:"evaluating_services"`
+	Tier1Pass            bool     `json:"tier1_pass"`
+	Signal               string   `json:"signal"`
+	Unit                 string   `json:"unit"`
+	Query                string   `json:"query"`
+	Before               float64  `json:"before"`
+	After                float64  `json:"after"`
+	Delta                float64  `json:"delta"`
+	MinDelta             float64  `json:"min_delta"`
+	Tier2Pass            bool     `json:"tier2_pass"`
+	Valid                bool     `json:"valid"`
+	Status               string   `json:"status"`
+	Note                 string   `json:"note,omitempty"`
+	ElapsedSeconds       float64  `json:"elapsed_seconds"`
 }
 
 func writeResults(dir string, verdicts []inject.Verdict, settle, recover time.Duration) error {
@@ -179,12 +206,15 @@ func writeResults(dir string, verdicts []inject.Verdict, settle, recover time.Du
 			Flag: v.Spec.Flag, Variant: v.Spec.Variant,
 			Class: string(v.Spec.Class), RootCause: v.Spec.RootCause,
 			SymptomAt: v.Spec.SymptomAt, Difficulty: string(v.Spec.Difficulty),
-			EvalRate: v.EvalRate, EvaluatingServices: svcs, Tier1Pass: v.Tier1Pass,
+			Site: v.Spec.Site, SyntheticLoadReaches: v.Spec.SyntheticLoadReaches,
+			ReloadObserved: v.ReloadObserved,
+			EvalRate:       v.EvalRate, EvaluatingServices: svcs, Tier1Pass: v.Tier1Pass,
+			Signal: v.Signal, Unit: v.Unit,
+			Query:  strings.Join(strings.Fields(v.Query), " "),
 			Before: v.Before, After: v.After, Delta: v.Delta,
 			MinDelta: v.MinDelta, Tier2Pass: v.Tier2Pass,
 			Valid: v.Valid(), Status: v.Status(),
-			Effect: strings.Join(strings.Fields(v.Spec.Effect), " "),
-			Note:   v.Spec.Note, ElapsedSeconds: v.Elapsed.Seconds(),
+			Note: v.Spec.Note, ElapsedSeconds: v.Elapsed.Seconds(),
 		})
 	}
 
@@ -216,20 +246,26 @@ func renderMarkdown(recs []record, settle, recover time.Duration) string {
 	b.WriteString(fmt.Sprintf("settle `%s` / recover `%s`\n\n", settle, recover))
 	b.WriteString("两级判据：**一级**该 flag 是否有服务在评估（静态属性，非前后差值）；" +
 		"**二级**预期信号是否发生偏移。两级都过才可进场景库。\n\n")
-	b.WriteString("| flag | 类别 | 根因 | 症状服务 | 难度 | 评估服务 | before | after | delta | 阈值 | 结论 |\n")
-	b.WriteString("|---|---|---|---|---|---|---:|---:|---:|---:|---|\n")
+	b.WriteString("| flag | 类别 | 根因 | 症状服务 | 难度 | 信号 | before | after | delta | 阈值 | 单位 | reload | 结论 |\n")
+	b.WriteString("|---|---|---|---|---|---|---:|---:|---:|---:|---|:-:|---|\n")
 	for _, r := range recs {
-		svcs := strings.Join(r.EvaluatingServices, ", ")
-		if svcs == "" {
-			svcs = "—"
-		}
 		verdict := "❌ " + r.Status
 		if r.Valid {
 			verdict = "✅ 可用"
 		}
-		b.WriteString(fmt.Sprintf("| `%s` | %s | %s | %s | %s | %s | %.4g | %.4g | %+.4g | %.4g | %s |\n",
-			r.Flag, r.Class, r.RootCause, r.SymptomAt, r.Difficulty, svcs,
-			r.Before, r.After, r.Delta, r.MinDelta, verdict))
+		reload := "✗"
+		if r.ReloadObserved {
+			reload = "✓"
+		}
+		b.WriteString(fmt.Sprintf("| `%s` | %s | %s | %s | %s | `%s` | %.4g | %.4g | %+.4g | %.4g | %s | %s | %s |\n",
+			r.Flag, r.Class, r.RootCause, r.SymptomAt, r.Difficulty, r.Signal,
+			r.Before, r.After, r.Delta, r.MinDelta, r.Unit, reload, verdict))
+	}
+
+	b.WriteString("\n## 源码作用点\n\n")
+	b.WriteString("爆炸半径由这些位置的代码决定，不是由 flag 名字决定。\n\n")
+	for _, r := range recs {
+		b.WriteString(fmt.Sprintf("- **`%s`** → `%s`\n", r.Flag, r.Site))
 	}
 
 	b.WriteString("\n## 备注\n\n")
@@ -238,9 +274,12 @@ func renderMarkdown(recs []record, settle, recover time.Duration) string {
 			b.WriteString(fmt.Sprintf("- **`%s`** — %s\n", r.Flag, r.Note))
 		}
 	}
+
 	b.WriteString("\n## 判据查询\n\n")
+	b.WriteString("定义在 `queries/signals.yaml`，Go 校验器与 Python 工具层共用。\n\n")
 	for _, r := range recs {
-		b.WriteString(fmt.Sprintf("- **`%s`**\n  ```promql\n  %s\n  ```\n", r.Flag, r.Effect))
+		b.WriteString(fmt.Sprintf("- **`%s`** (signal `%s`)\n  ```promql\n  %s\n  ```\n",
+			r.Flag, r.Signal, r.Query))
 	}
 	return b.String()
 }
