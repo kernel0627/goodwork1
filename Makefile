@@ -135,6 +135,21 @@ agent-health: ## 查 Agent 服务状态
 characterize: ## 逐条校验 13 个故障是否真的生效（约 52 分钟）
 	cd gateway && go run ./cmd/characterize
 
+.PHONY: scenarios
+scenarios: ## 从校验结果生成场景库（只含通过双重校验的故障）
+	cd gateway && go run ./cmd/scenarios
+
+.PHONY: eval
+eval: ## 跑场景库并判分（需先 make agent-bg）
+	cd gateway && go run ./cmd/eval
+
+.PHONY: eval-random
+eval-random: ## 用随机 Agent 验证判分框架本身没 bug —— 真 Agent 之前必须先跑这个
+	@$(MAKE) agent-stop >/dev/null 2>&1 || true
+	@$(MAKE) agent-bg BRAIN=random
+	cd gateway && go run ./cmd/eval
+	@$(MAKE) agent-stop
+
 # ---------- 构建 ----------
 
 .PHONY: build
