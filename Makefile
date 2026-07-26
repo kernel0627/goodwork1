@@ -98,6 +98,43 @@ sut-health: ## 汇总健康状态：running / healthy 计数
 probe: ## 跑可观测面探针（sut-up 之后执行，全绿才继续往下做）
 	cd gateway && go run ./cmd/probe
 
+# ---------- Agent 服务 ----------
+
+BRAIN ?= random
+AGENT_HOST := $(firstword $(subst :, ,$(or $(AGENT_ADDR),127.0.0.1:7802)))
+AGENT_PORT := $(lastword $(subst :, ,$(or $(AGENT_ADDR),127.0.0.1:7802)))
+
+.PHONY: agent
+agent: ## 前台启动 Agent 服务（BRAIN=random|checklist|oneshot|react|medic）
+	MEDIC_BRAIN=$(BRAIN) $(PY) -m uvicorn --app-dir agent medic.service:app \
+	  --host $(AGENT_HOST) --port $(AGENT_PORT) --log-level warning
+
+.PHONY: agent-bg
+agent-bg: ## 后台启动 Agent 服务并等它就绪
+	@MEDIC_BRAIN=$(BRAIN) nohup $(PY) -m uvicorn --app-dir agent medic.service:app \
+	  --host $(AGENT_HOST) --port $(AGENT_PORT) --log-level warning \
+	  > results/agent.log 2>&1 & \
+	for i in $$(seq 1 30); do \
+	  curl -sf http://$(AGENT_HOST):$(AGENT_PORT)/healthz >/dev/null && \
+	    echo "agent ready (brain=$(BRAIN))" && exit 0; \
+	  sleep 1; \
+	done; echo "agent failed to start; see results/agent.log"; exit 1
+
+.PHONY: agent-stop
+agent-stop: ## 停掉 Agent 服务
+	@pkill -f "medic.service:app" 2>/dev/null && echo "stopped" || echo "not running"
+
+.PHONY: agent-health
+agent-health: ## 查 Agent 服务状态
+	@curl -sf http://$(AGENT_HOST):$(AGENT_PORT)/healthz | $(PY) -m json.tool \
+	  || echo "agent not reachable"
+
+# ---------- 评测 ----------
+
+.PHONY: characterize
+characterize: ## 逐条校验 13 个故障是否真的生效（约 52 分钟）
+	cd gateway && go run ./cmd/characterize
+
 # ---------- 构建 ----------
 
 .PHONY: build
