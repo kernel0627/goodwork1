@@ -193,9 +193,41 @@
   就是看它的调用方）。注意不能用 `server_address` 过滤 —— 实测那是**容器 IP**
   （`172.18.0.15`），重启就变；要用 `rpc_method=~"oteldemo.PaymentService/.*"`
 
+- [x] **一级判据已重做** → `internal/dockerlog`
+  - 改读 **flagd 容器日志**里的 `filepath event ... WRITE`。它对全部 13 个故障都成立，
+    不依赖某个服务的 SDK 是否上报评估指标。写文件前先记下日志位置，
+    避免被上个场景的事件满足
+  - 诚实说：日志比指标弱（只证明 flagd 读了文件，不证明服务拿到了新值）。
+    但它是唯一普适的信号，配合源码验证过的 `Site` 能覆盖它单独证明不了的部分
+  - 新增 `UNREACHABLE` 判定类别，与"失败"区分。两个合成流量打不到的故障
+    不再让整次运行非 0 退出 —— 否则一次正确的运行会永远看起来是坏的
+- [x] **catalog 已接入 signals.yaml**，不再自己拼 PromQL。
+  Go 校验器与 Python 工具层**由构造保证**测法一致，不靠纪律
+- [x] **T5 只读诊断工具层完成** —— 12 个工具，22 个 Python 测试全过
+  - 指标：`list_services` `get_service_health` `get_endpoint_breakdown`
+    `get_client_calls` `get_resource_usage` `get_queue_lag` `promql`
+  - 链路：`get_service_topology` `find_error_traces` `get_trace`
+  - 日志：`query_logs` `find_error_logs`
+  - **截断必须说明自己截断了**：Agent 分不清"看到全部"和"看到一部分"，
+    就会得出数据不支持的结论
+  - **工具失败返回可读结果而非抛异常**：诊断场景下失败是常态
+    （被查的服务可能就是挂掉的那个），"这次调用失败因为 X"本身是观测
+  - **拼错服务名必须与"该服务没有服务端指标"区分开** —— 两者都返回全 0，
+    混在一起的话拼错会被当成证据。现在会报错并给近似匹配
+  - `get_service_topology` **只用 Jaeger 实测调用数据**，不硬编码。
+    硬编码等于把归因问题的一半答案直接给它，还会让「关掉拓扑工具」的消融失去意义。
+    自环边已过滤（实测自环是调用量最大的 6 条边，留着会把真实依赖图埋掉）
+  - `Registry.without()` 支持消融，一行调用即可撤掉某个工具
+  - **实测验证**：characterization 注入 `adFailure` 期间，`find_error_traces`
+    独立地报出了 `ad oteldemo.AdService/GetAds, 6 failed spans`；
+    实测拓扑与读源码推出的依赖关系一致
+
 ### 🔄 进行中
 
-- [ ] **T3 收尾（阻塞项已全部解除，可以跑了）**
+- [ ] **T3 全量 characterization 正在跑**（13 个故障，约 52 分钟）
+  - 第 1 个已出：`adFailure` **OK**，`before=0 → after=0.09524`（9.5% 错误比例）。
+    改用比例判定后，这个原本被误判 inert 的故障通过了
+  - 跑完后填 `docs/faults.md` §3 的「验证状态」列
   - ⚠️ **一级判据要重做**：flagd 的评估指标**只有 .NET 的 cart 服务上报**，
     烟测里 `adFailure` 因此被判 "dead"。除 cart 读的两个 flag 外，其余 11 个永远假阴性。
     替代方案：读 **flagd 容器日志**里的 `filepath event ... WRITE`（已确认它会打），
